@@ -8,9 +8,6 @@ from __future__ import annotations
 
 from typing import List, Optional, Tuple
 
-import matplotlib
-
-matplotlib.use("Agg")  # headless-safe
 import matplotlib.dates as mdates
 import matplotlib.pyplot as plt
 import numpy as np
@@ -65,48 +62,47 @@ def plot_raw_timeline(
     save_fig: Optional[str],
     train_frac: float = None,
     train_cutoff_time: Optional[pd.Timestamp] = None,
-    min_window_minutes: float = 5.0,
     show_window_labels: bool = True,
     window_label_fontsize: int = 9,
     window_label_format: str = "{id}",
-    feature_label: Optional[str] = None,
     risk_alarm_mask: Optional[pd.Series] = None,
+    risk_threshold: Optional[float] = None,
     early_warning_minutes: float = 120.0,
 ):
     fig, ax = plt.subplots(figsize=(14, 5.5))
 
-    risk_series = df_plot["maintenance_risk"].astype(float).fillna(0.0)
-    threshold_line = None
-    if risk_alarm_mask is not None:
-        risk_alarm_mask = risk_alarm_mask.reindex(df_plot.index).fillna(0).astype(bool)
-        alarm_idx = risk_alarm_mask & (~risk_alarm_mask.shift(1, fill_value=False))
-        ax.scatter(
-            df_plot.index[risk_alarm_mask],
-            risk_series[risk_alarm_mask],
-            s=12,
-            color="#D32F2F",
-            alpha=0.9,
-            label="Risk alarm",
-        )
-        ax.scatter(
-            df_plot.index[~risk_alarm_mask],
-            risk_series[~risk_alarm_mask],
-            s=10,
-            color="#1976D2",
-            alpha=0.5,
-            label="Below threshold",
-        )
-        if risk_alarm_mask.any():
-            threshold_line = risk_series[risk_alarm_mask].min()
-    else:
-        ax.scatter(
-            df_plot.index,
-            risk_series,
-            s=10,
-            color="#1976D2",
-            alpha=0.6,
-            label="Maintenance risk",
-        )
+    if "maintenance_risk" not in df_plot.columns:
+        raise ValueError("maintenance_risk column required for plotting.")
+
+    state = (
+        risk_alarm_mask.reindex(df_plot.index).fillna(0).astype(bool)
+        if risk_alarm_mask is not None
+        else pd.Series(False, index=df_plot.index)
+    )
+
+    ax.fill_between(
+        df_plot.index,
+        0,
+        1,
+        where=~state.values,
+        color="#2E7D32",
+        alpha=0.2,
+        step="post",
+        label="Normal",
+    )
+    risk_label = "Risk alarm"
+    if risk_threshold is not None:
+        risk_label = f"Risk alarm (≥ θ={risk_threshold:.2f})"
+    ax.fill_between(
+        df_plot.index,
+        0,
+        1,
+        where=state.values,
+        color="#C62828",
+        alpha=0.55,
+        step="post",
+        label=risk_label,
+    )
 
     # Training cutoff
     cutoff_ts = train_cutoff_time
@@ -186,12 +182,15 @@ def plot_raw_timeline(
                         lane_idx = idx
                     last_x_in_lane[lane_idx] = xnum
                 ax.text(
-                    x_for_label, lanes_y[lane_idx], label,
+                    x_for_label,
+                    lanes_y[lane_idx],
+                    label,
                     transform=xaxis_transform,
                     fontsize=window_label_fontsize,
                     color="#5D4037",
-                    ha="center", va="bottom",
-                    bbox=dict(boxstyle="round,pad=0.2", fc="white", ec="#FFC107", alpha=0.9, linewidth=0.8)
+                    ha="center",
+                    va="bottom",
+                    bbox=dict(boxstyle="round,pad=0.2", fc="white", ec="#FFC107", alpha=0.9, linewidth=0.8),
                 )
             except Exception:
                 pass
@@ -209,9 +208,13 @@ def plot_raw_timeline(
     ax.legend(handles, labels, loc="best")
 
     ax.set_xlabel("Time")
-    ax.set_ylabel("Maintenance risk")
-    ax.grid(True, alpha=0.2)
+    ax.set_ylabel("Risk state")
+    ax.set_yticks([0.25, 0.75])
+    ax.set_yticklabels(["Normal", "Risk"])
+    ax.set_ylim(0, 1)
+    ax.grid(True, axis="x", alpha=0.2)
 
     fig.tight_layout()
     if save_fig:
         fig.savefig(save_fig, dpi=160, bbox_inches="tight")
+    plt.show()

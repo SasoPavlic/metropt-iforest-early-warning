@@ -81,7 +81,7 @@ PRE_MAINTENANCE_HOURS: int = 2
 # Rolling risk default window (minutes).
 DEFAULT_RISK_WINDOW_MINUTES: int = 120
 # Default risk evaluation grid specification (start:stop:step).
-DEFAULT_RISK_GRID: str = "0.1:0.6:0.05"
+DEFAULT_RISK_GRID: str = "0.05:0.6:0.01"
 # Early-warning horizon for risk evaluation (minutes).
 EARLY_WARNING_MINUTES: int = 120
 # Exponential low-pass filter alpha for anomaly scores; 0 disables smoothing.
@@ -207,7 +207,6 @@ def main() -> None:
 
     # 6) Align predictions back to ORIGINAL (raw) time index
     plot_feature_name = PLOT_FEATURE
-    plot_feature_label: Optional[str] = plot_feature_name
     plot_pca_meta: Optional[dict] = None
     raw_num = df_raw.select_dtypes(include=[np.number])
     if PLOT_FEATURE and PLOT_FEATURE in df_raw.columns and PLOT_FEATURE not in raw_num.columns:
@@ -225,7 +224,6 @@ def main() -> None:
             )
             raw_reindexed[plot_pca_series.name] = plot_pca_series.reindex(raw_reindexed.index)
             plot_feature_name = plot_pca_series.name
-            plot_feature_label = plot_feature_name
         except Exception as exc:
             plot_pca_meta = None
             print(f"[WARN] Plot PCA feature generation failed ({exc}); falling back to configured plot feature.")
@@ -234,13 +232,11 @@ def main() -> None:
         ratios = plot_pca_meta.get("explained_variance_ratio", [])
         ratio_val = ratios[comp_idx - 1] if 0 <= comp_idx - 1 < len(ratios) else None
         if ratio_val is not None:
-            plot_feature_label = f"{plot_feature_name} (PCA component #{comp_idx}, var={ratio_val:.2%})"
             print(
                 f"[INFO] Plot PCA component #{comp_idx} derived from {plot_pca_meta.get('n_components')} total components "
                 f"(explained variance ratio={ratio_val:.4f})."
             )
         else:
-            plot_feature_label = f"{plot_feature_name} (PCA component #{comp_idx})"
             print(
                 f"[INFO] Plot PCA component #{comp_idx} derived from {plot_pca_meta.get('n_components')} total components."
             )
@@ -253,10 +249,6 @@ def main() -> None:
         if plot_feature_name:
             print(f"[WARN] Plot feature '{plot_feature_name}' unavailable after alignment; using '{fallback_name}' instead.")
         plot_feature_name = fallback_name
-        plot_feature_label = f"{plot_feature_name} (auto-selected)"
-
-    if not plot_feature_label:
-        plot_feature_label = plot_feature_name
 
     # 7) Maintenance windows + operation phase feature
     maint_windows = parse_maintenance_windows(
@@ -305,7 +297,7 @@ def main() -> None:
                 f"Recall={best['recall']:.4f}  F1={best['f1']:.4f}"
             )
             best_risk_threshold = float(best["threshold"])
-            risk_alarm_mask = (maintenance_risk >= best_risk_threshold).astype(int)
+            risk_alarm_mask = (maintenance_risk >= best_risk_threshold).astype(bool)
 
     # 8) Prepare & plot
     df_plot = prepare_plot_frame(
@@ -332,12 +324,11 @@ def main() -> None:
         save_fig=args.save_fig,
         train_frac=TRAIN_FRAC,
         train_cutoff_time=train_cutoff_ts,
-        min_window_minutes=SHORT_WINDOW_MINUTES,
         show_window_labels=effective_show_labels,
         window_label_fontsize=WINDOW_LABEL_FONTSIZE,
         window_label_format=WINDOW_LABEL_FORMAT,
-        feature_label=plot_feature_label,
         risk_alarm_mask=risk_alarm_mask,
+        risk_threshold=best_risk_threshold,
         early_warning_minutes=EARLY_WARNING_MINUTES,
     )
 
