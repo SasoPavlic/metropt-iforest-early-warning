@@ -53,10 +53,16 @@ def parse_risk_grid_spec(spec: str) -> List[float]:
 # -----------------------------
 # Configuration constants
 # -----------------------------
+# --- Data loading / preprocessing ---
 # Timestamp column name in the input CSV; set to None to auto-detect.
 INPUT_TIMESTAMP_COL: Optional[str] = None
 # Whether to drop unnamed index columns commonly created by pandas when saving CSVs.
 DROP_UNNAMED_INDEX: bool = True
+# Input/outputs
+INPUT_PATH: str = "MetroPT3.csv"
+SAVE_FIG_PATH: Optional[str] = "metropt3_iforest_raw.png"
+SAVE_PRED_CSV_PATH: Optional[str] = "metropt3_iforest_pred.csv"
+
 # Optional time-based pre-downsampling rule (e.g., '60s') to regularize cadence before feature building; None disables.
 PRE_DOWNSAMPLE_RULE: Optional[str] = None
 # Rolling window for feature aggregation (e.g., '600s' = 10 minutes).
@@ -67,16 +73,20 @@ TRAIN_FRAC: float = 0.33
 MAX_BASE_FEATURES: int = 12
 # Exclude near-binary numeric columns from features to focus on informative signals.
 EXCLUDE_QUASI_BINARY: bool = True
-# Hours before maintenance start considered pre-maintenance (operation_phase=1).
-PRE_MAINTENANCE_HOURS: int = 2
-# Rolling risk default window (minutes).
-DEFAULT_RISK_WINDOW_MINUTES: int = 120
-# Default risk evaluation grid specification (start:stop:step).
-DEFAULT_RISK_GRID: str = "0.05:0.6:0.01"
+
+# --- Modeling / scoring ---
+# Exponential low-pass filter alpha for anomaly scores; 0 disables smoothing.
+LPF_ALPHA: float = 0.4
+# Rolling risk window (minutes).
+RISK_WINDOW_MINUTES: int = 120
+# Risk evaluation grid specification (start:stop:step).
+RISK_EVAL_GRID_SPEC: str = "0.05:0.6:0.01"
 # Early-warning horizon for risk evaluation (minutes).
 EARLY_WARNING_MINUTES: int = 120
-# Exponential low-pass filter alpha for anomaly scores; 0 disables smoothing.
-LPF_ALPHA: float = 0
+
+# --- Maintenance context / plotting ---
+# Hours before maintenance start considered pre-maintenance (operation_phase=1).
+PRE_MAINTENANCE_HOURS: int = 2
 # Show labels for maintenance windows (IDs/severity) on the plot.
 SHOW_WINDOW_LABELS: bool = True
 # Font size for maintenance window labels.
@@ -126,25 +136,8 @@ DEFAULT_METROPT_WINDOWS: List[Tuple[str, str, str, str]] = [
 
 
 def main() -> None:
-    ap = argparse.ArgumentParser(description="IsolationForest anomaly explorer (MetroPT-3, CSV-only).")
-    ap.add_argument("--input", required=True, help="Path to input CSV/TXT file.")
-    ap.add_argument("--save_fig", default=None, help="Optional path to save the plotted figure.")
-    ap.add_argument("--save_pred_csv", default=None, help="Optional path to save per-point predictions.")
-    ap.add_argument(
-        "--risk_window_minutes",
-        type=int,
-        default=DEFAULT_RISK_WINDOW_MINUTES,
-        help="Rolling window (minutes) for maintenance_risk calculation.",
-    )
-    ap.add_argument(
-        "--risk_eval_grid",
-        default=DEFAULT_RISK_GRID,
-        help="Grid spec 'start:stop:step' for maintenance_risk event-level evaluation.",
-    )
-    args = ap.parse_args()
-
     # 1) Load raw (CSV-only)
-    df_raw = load_csv(args.input, INPUT_TIMESTAMP_COL, drop_unnamed=DROP_UNNAMED_INDEX)
+    df_raw = load_csv(INPUT_PATH, INPUT_TIMESTAMP_COL, drop_unnamed=DROP_UNNAMED_INDEX)
 
     # 2) Pre-downsample (optional) before feature building
     df_ds = pre_downsample(df_raw, PRE_DOWNSAMPLE_RULE)
@@ -168,7 +161,7 @@ def main() -> None:
     )
 
     # Rolling maintenance risk from exceedance of the training threshold
-    risk_window_minutes = max(1, int(args.risk_window_minutes))
+    risk_window_minutes = RISK_WINDOW_MINUTES
     score_for_risk = (
         pred["anom_score_lpf"] if "anom_score_lpf" in pred.columns else pred["anom_score"]
     ).astype(float).fillna(0.0)
@@ -206,8 +199,9 @@ def main() -> None:
     risk_thresholds: List[float] = []
     risk_alarm_mask: Optional[pd.Series] = None
     best_risk_threshold: Optional[float] = None
+    risk_thresholds = []
     try:
-        risk_thresholds = parse_risk_grid_spec(args.risk_eval_grid)
+        risk_thresholds = parse_risk_grid_spec(RISK_EVAL_GRID_SPEC)
     except ValueError as exc:
         print(f"[WARN] Skipping maintenance_risk evaluation: {exc}")
     if risk_thresholds:
@@ -250,7 +244,7 @@ def main() -> None:
     plot_raw_timeline(
         df_plot,
         maint_windows,
-        save_fig=args.save_fig,
+        save_fig=SAVE_FIG_PATH,
         train_frac=TRAIN_FRAC,
         train_cutoff_time=train_cutoff_ts,
         show_window_labels=effective_show_labels,
@@ -262,10 +256,10 @@ def main() -> None:
     )
 
     # 9) Optional: save per-point predictions (timestamp, score, is_anomaly)
-    if args.save_pred_csv:
+    if SAVE_PRED_CSV_PATH:
         out = pred.copy()
         out.index.name = "timestamp"
-        out.to_csv(args.save_pred_csv)
+        out.to_csv(SAVE_PRED_CSV_PATH)
 
     # --------- 10) Console summary + metrics ----------
     total_pts = int(pred["is_anomaly"].sum())

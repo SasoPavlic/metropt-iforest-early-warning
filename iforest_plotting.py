@@ -80,9 +80,8 @@ def plot_raw_timeline(
     else:
         xmin = xmax = None
 
-    # Visualize maintenance windows + early-warning lead
+    # Visualize maintenance windows
     span_drawn = False
-    # Lead windows removed; no warn shading drawn
     horizon = pd.to_timedelta(float(max(0.0, early_warning_minutes)), unit="m")
 
     # Label placement lanes
@@ -112,7 +111,7 @@ def plot_raw_timeline(
 
         dur_min_real = max(0.0, (e - s).total_seconds() / 60.0)
 
-        ax.axvspan(s_clip, e_clip, color="#FFC107", alpha=0.35, lw=0, zorder=3)
+        ax.axvspan(s_clip, e_clip, color="#1565C0", alpha=0.35, lw=0, zorder=3)
         span_drawn = True
         x_for_label = s_clip + (e_clip - s_clip) / 2
 
@@ -151,7 +150,7 @@ def plot_raw_timeline(
 
     handles, labels = ax.get_legend_handles_labels()
     if span_drawn:
-        handles.append(Patch(facecolor="#FFC107", alpha=0.25, label="Failure window"))
+        handles.append(Patch(facecolor="#1565C0", alpha=0.35, label="Failure window"))
         labels.append("Failure window")
     # Lead window legend removed as spans are not drawn
     ax.legend(handles, labels, loc="best")
