@@ -89,7 +89,7 @@ LPF_ALPHA: float = 0
 # Name of the column to plot as context; None chooses the first numeric column.
 PLOT_FEATURE: Optional[str] = "DV_pressure"
 # Plot every Nth point to reduce density; 1 means no thinning.
-PLOT_STRIDE: int = 10
+PLOT_STRIDE: int = 100
 # Optional rolling median rule for the plotted Y only (e.g., '60s'); None disables.
 PLOT_ROLLING: Optional[str] = None
 # Short windows (minutes) threshold: windows with duration <= this are drawn as vertical lines.
@@ -277,6 +277,8 @@ def main() -> None:
 
     # Event-level evaluation of maintenance_risk thresholds
     risk_thresholds: List[float] = []
+    risk_alarm_mask: Optional[pd.Series] = None
+    best_risk_threshold: Optional[float] = None
     try:
         risk_thresholds = parse_risk_grid_spec(args.risk_eval_grid)
     except ValueError as exc:
@@ -296,12 +298,14 @@ def main() -> None:
                 print(
                     f"[RISK] θ={res['threshold']:.2f}  Precision={res['precision']:.4f}  "
                     f"Recall={res['recall']:.4f}  F1={res['f1']:.4f}  TP={res['tp']}  FP={res['fp']}  FN={res['fn']}"
-                )
+            )
             best = max(risk_results, key=lambda r: (r["f1"], r["precision"], -r["threshold"]))
             print(
                 f"[RISK] Best θ={best['threshold']:.2f}: Precision={best['precision']:.4f}  "
                 f"Recall={best['recall']:.4f}  F1={best['f1']:.4f}"
             )
+            best_risk_threshold = float(best["threshold"])
+            risk_alarm_mask = (maintenance_risk >= best_risk_threshold).astype(int)
 
     # 8) Prepare & plot
     df_plot = prepare_plot_frame(
@@ -333,6 +337,8 @@ def main() -> None:
         window_label_fontsize=WINDOW_LABEL_FONTSIZE,
         window_label_format=WINDOW_LABEL_FORMAT,
         feature_label=plot_feature_label,
+        risk_alarm_mask=risk_alarm_mask,
+        early_warning_minutes=EARLY_WARNING_MINUTES,
     )
 
     # 9) Optional: save per-point predictions (timestamp, score, is_anomaly)

@@ -70,19 +70,43 @@ def plot_raw_timeline(
     window_label_fontsize: int = 9,
     window_label_format: str = "{id}",
     feature_label: Optional[str] = None,
+    risk_alarm_mask: Optional[pd.Series] = None,
+    early_warning_minutes: float = 120.0,
 ):
-    fig, (ax, ax_state) = plt.subplots(
-        nrows=2,
-        ncols=1,
-        figsize=(14, 6),
-        sharex=True,
-        gridspec_kw={"height_ratios": [4, 1], "hspace": 0.08},
-    )
-    normal = df_plot[df_plot["is_anomaly"] == 0]
-    anom = df_plot[df_plot["is_anomaly"] == 1]
+    fig, ax = plt.subplots(figsize=(14, 5.5))
 
-    ax.scatter(normal.index, normal["y_plot"], s=8, alpha=0.7, label="Normal")
-    ax.scatter(anom.index, anom["y_plot"], s=10, alpha=0.9, label="Anomalous")
+    risk_series = df_plot["maintenance_risk"].astype(float).fillna(0.0)
+    threshold_line = None
+    if risk_alarm_mask is not None:
+        risk_alarm_mask = risk_alarm_mask.reindex(df_plot.index).fillna(0).astype(bool)
+        alarm_idx = risk_alarm_mask & (~risk_alarm_mask.shift(1, fill_value=False))
+        ax.scatter(
+            df_plot.index[risk_alarm_mask],
+            risk_series[risk_alarm_mask],
+            s=12,
+            color="#D32F2F",
+            alpha=0.9,
+            label="Risk alarm",
+        )
+        ax.scatter(
+            df_plot.index[~risk_alarm_mask],
+            risk_series[~risk_alarm_mask],
+            s=10,
+            color="#1976D2",
+            alpha=0.5,
+            label="Below threshold",
+        )
+        if risk_alarm_mask.any():
+            threshold_line = risk_series[risk_alarm_mask].min()
+    else:
+        ax.scatter(
+            df_plot.index,
+            risk_series,
+            s=10,
+            color="#1976D2",
+            alpha=0.6,
+            label="Maintenance risk",
+        )
 
     # Training cutoff
     cutoff_ts = train_cutoff_time
@@ -100,10 +124,10 @@ def plot_raw_timeline(
     else:
         xmin = xmax = None
 
-    # Visualize maintenance windows
+    # Visualize maintenance windows + early-warning lead
     span_drawn = False
-    vline_drawn = False
-    min_sec = max(0.0, float(min_window_minutes)) * 60.0
+    warn_drawn = False
+    horizon = pd.to_timedelta(float(max(0.0, early_warning_minutes)), unit="m")
 
     # Label placement lanes
     lanes_y = [1.02, 1.06, 1.10]
@@ -130,18 +154,19 @@ def plot_raw_timeline(
         else:
             s_clip, e_clip = s, e
 
-        dur_sec_real = (e - s).total_seconds()
-        dur_min_real = max(0.0, dur_sec_real / 60.0)
-        dur_sec = (e_clip - s_clip).total_seconds()
+        dur_min_real = max(0.0, (e - s).total_seconds() / 60.0)
 
-        if dur_sec <= min_sec:
-            ax.axvline(s_clip, color="#FFC107", alpha=0.8, linewidth=1.6)
-            vline_drawn = True
-            x_for_label = s_clip
-        else:
-            ax.axvspan(s_clip, e_clip, color="#FFC107", alpha=0.25, lw=0)
-            span_drawn = True
-            x_for_label = s_clip + (e_clip - s_clip) / 2
+        ax.axvspan(s_clip, e_clip, color="#FFC107", alpha=0.25, lw=0)
+        span_drawn = True
+        x_for_label = s_clip + (e_clip - s_clip) / 2
+
+        if horizon > pd.Timedelta(0):
+            warn_start = s - horizon
+            warn_start = max(warn_start, xmin) if xmin is not None else warn_start
+            ax.axvspan(warn_start, s, color="#90CAF9", alpha=0.18, lw=0)
+            ax.axvline(warn_start, color="#0288D1", linestyle="--", linewidth=1.2)
+            ax.axvline(s, color="#0288D1", linestyle="--", linewidth=1.2)
+            warn_drawn = True
 
         if show_window_labels:
             try:
@@ -175,43 +200,17 @@ def plot_raw_timeline(
     if span_drawn:
         handles.append(Patch(facecolor="#FFC107", alpha=0.25, label="Failure window"))
         labels.append("Failure window")
-    if vline_drawn:
+    if warn_drawn:
         from matplotlib.lines import Line2D
-        handles.append(Line2D([0], [0], color="#FFC107", lw=1.6, alpha=0.8, label="Short failure (line)"))
-        labels.append("Short failure (line)")
+        handles.append(Line2D([0], [0], color="#0288D1", linestyle="--", lw=1.2, label="Early-warning horizon"))
+        labels.append("Early-warning horizon")
+        handles.append(Patch(facecolor="#90CAF9", alpha=0.18, label="Lead window"))
+        labels.append("Lead window")
     ax.legend(handles, labels, loc="best")
 
-    ax.set_ylabel(feature_label)
+    ax.set_xlabel("Time")
+    ax.set_ylabel("Maintenance risk")
     ax.grid(True, alpha=0.2)
-
-    # --- State subplot showing anomaly bands ---
-    state_vals = df_plot["is_anomaly"].astype(int)
-    ax_state.fill_between(
-        df_plot.index,
-        0,
-        1,
-        where=(state_vals == 0),
-        color="#388E3C",
-        alpha=0.2,
-        step="post",
-        label="Normal",
-    )
-    ax_state.fill_between(
-        df_plot.index,
-        0,
-        1,
-        where=(state_vals == 1),
-        color="#D32F2F",
-        alpha=0.5,
-        step="post",
-        label="Anomaly detected",
-    )
-    ax_state.set_ylim(0, 1)
-    ax_state.set_yticks([0.25, 0.75])
-    ax_state.set_yticklabels(["Normal", "Anomaly"])
-    ax_state.set_xlabel("Time")
-    ax_state.set_ylabel("State")
-    ax_state.grid(True, alpha=0.2)
 
     fig.tight_layout()
     if save_fig:
