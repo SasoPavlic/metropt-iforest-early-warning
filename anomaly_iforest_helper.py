@@ -66,7 +66,7 @@ SAVE_PRED_CSV_PATH: Optional[str] = "metropt3_iforest_pred.csv"
 # Optional time-based pre-downsampling rule (e.g., '60s') to regularize cadence before feature building; None disables.
 PRE_DOWNSAMPLE_RULE: Optional[str] = None
 # Rolling window for feature aggregation (e.g., '600s' = 10 minutes).
-ROLLING_WINDOW: str = "600s"
+ROLLING_WINDOW: str = "60s"
 # Fraction of earliest data used to train the IsolationForest.
 TRAIN_FRAC: float = 0.33
 # Limit of most-variable base numeric features to keep before rolling aggregation.
@@ -78,7 +78,7 @@ EXCLUDE_QUASI_BINARY: bool = True
 # Exponential low-pass filter alpha for anomaly scores; 0 disables smoothing.
 LPF_ALPHA: float = 0.4
 # Rolling risk window (minutes).
-RISK_WINDOW_MINUTES: int = 120
+RISK_WINDOW_MINUTES: int = 1920
 # Risk evaluation grid specification (start:stop:step).
 RISK_EVAL_GRID_SPEC: str = "0.05:0.6:0.01"
 # Early-warning horizon for risk evaluation (minutes).
@@ -223,7 +223,8 @@ def main() -> None:
             best = max(risk_results, key=lambda r: (r["f1"], r["precision"], -r["threshold"]))
             print(
                 f"[RISK] Best θ={best['threshold']:.2f}: Precision={best['precision']:.4f}  "
-                f"Recall={best['recall']:.4f}  F1={best['f1']:.4f}"
+                f"Recall={best['recall']:.4f}  F1={best['f1']:.4f}  "
+                f"TP={best['tp']}  FP={best['fp']}  FN={best['fn']}"
             )
             best_risk_threshold = float(best["threshold"])
             risk_alarm_mask = (maintenance_risk >= best_risk_threshold).astype(bool)

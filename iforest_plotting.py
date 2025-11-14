@@ -15,17 +15,17 @@ from matplotlib.patches import Patch
 
 
 def plot_raw_timeline(
-    df_plot: pd.DataFrame,
-    maintenance_windows: List[Tuple],
-    save_fig: Optional[str],
-    train_frac: float = None,
-    train_cutoff_time: Optional[pd.Timestamp] = None,
-    show_window_labels: bool = True,
-    window_label_fontsize: int = 9,
-    window_label_format: str = "{id}",
-    risk_alarm_mask: Optional[pd.Series] = None,
-    risk_threshold: Optional[float] = None,
-    early_warning_minutes: float = 120.0,
+        df_plot: pd.DataFrame,
+        maintenance_windows: List[Tuple],
+        save_fig: Optional[str],
+        train_frac: float = None,
+        train_cutoff_time: Optional[pd.Timestamp] = None,
+        show_window_labels: bool = True,
+        window_label_fontsize: int = 9,
+        window_label_format: str = "{id}",
+        risk_alarm_mask: Optional[pd.Series] = None,
+        risk_threshold: Optional[float] = None,
+        early_warning_minutes: float = 120.0,
 ):
     fig, ax = plt.subplots(figsize=(14, 5.5))
 
@@ -43,11 +43,11 @@ def plot_raw_timeline(
         0,
         1,
         where=~state.values,
-        color="#2E7D32",
-        alpha=0.18,
+        color="#F4F9F4",
+        alpha=0.35,
         step="post",
         label="Normal",
-        zorder=1,
+        zorder=0,
     )
     risk_label = "Risk alarm"
     if risk_threshold is not None:
@@ -57,11 +57,10 @@ def plot_raw_timeline(
         0,
         1,
         where=state.values,
-        color="#C62828",
-        alpha=0.5,
-        step="post",
+        color="#FF7043",
+        alpha=0.25,
         label=risk_label,
-        zorder=2,
+        zorder=1,
     )
 
     # Training cutoff
@@ -111,7 +110,15 @@ def plot_raw_timeline(
 
         dur_min_real = max(0.0, (e - s).total_seconds() / 60.0)
 
-        ax.axvspan(s_clip, e_clip, color="#1565C0", alpha=0.35, lw=0, zorder=3)
+        ax.axvspan(
+            s_clip,
+            e_clip,
+            facecolor="#1E88E5",
+            edgecolor="#0D47A1",
+            alpha=0.55,
+            linewidth=1.2,
+            zorder=4,
+        )
         span_drawn = True
         x_for_label = s_clip + (e_clip - s_clip) / 2
 
