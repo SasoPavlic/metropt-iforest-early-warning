@@ -28,7 +28,7 @@ from iforest_data import (
     select_numeric_features,
     top_k_by_variance,
 )
-from iforest_metrics import confusion_and_scores, evaluate_risk_thresholds, window_mask
+from iforest_metrics import evaluate_risk_thresholds
 from iforest_model import train_iforest_and_score
 from iforest_plotting import plot_raw_timeline
 
@@ -62,17 +62,18 @@ DROP_UNNAMED_INDEX: bool = True
 INPUT_PATH: str = "MetroPT3.csv"
 SAVE_FIG_PATH: Optional[str] = "metropt3_iforest_raw.png"
 SAVE_PRED_CSV_PATH: Optional[str] = "metropt3_iforest_pred.csv"
+SAVE_FEATURES_CSV_PATH: Optional[str] = "metropt3_iforest_features.csv"
 
 # Optional time-based pre-downsampling rule (e.g., '60s') to regularize cadence before feature building; None disables.
 PRE_DOWNSAMPLE_RULE: Optional[str] = None
 # Rolling window for feature aggregation (e.g., '600s' = 10 minutes).
 ROLLING_WINDOW: str = "60s"
 # Fraction of earliest data used to train the IsolationForest.
-TRAIN_FRAC: float = 0.33
+TRAIN_FRAC: float = 0.03
 # Limit of most-variable base numeric features to keep before rolling aggregation.
 MAX_BASE_FEATURES: int = 12
 # Exclude near-binary numeric columns from features to focus on informative signals.
-EXCLUDE_QUASI_BINARY: bool = True
+EXCLUDE_QUASI_BINARY: bool = False
 
 # --- Modeling / scoring ---
 # Exponential low-pass filter alpha for anomaly scores; 0 disables smoothing.
@@ -152,6 +153,10 @@ def main() -> None:
 
     # 4) Rolling features on the compact set
     X = build_rolling_features(df_base, rolling_window=ROLLING_WINDOW)
+    if SAVE_FEATURES_CSV_PATH:
+        feats_out = X.copy()
+        feats_out.index.name = "timestamp"
+        feats_out.to_csv(SAVE_FEATURES_CSV_PATH)
 
     # 5) Train IF + score (with optional LPF on scores)
     pred, info = train_iforest_and_score(
@@ -270,23 +275,6 @@ def main() -> None:
     print(f"[INFO] Point anomalies: {total_pts} ({pct_pts:.2f}%)")
     if info["threshold"] is not None:
         print(f"[INFO] Train-based threshold: {info['threshold']:.4f}")
-
-    # ---- Build ground-truth labels from windows and compute metrics ----
-    y_true_all = window_mask(pred.index, maint_windows)
-    y_pred_all = pd.Series(pred["is_anomaly"].astype(int).values, index=pred.index, name="is_anomaly")
-
-    m_all = confusion_and_scores(y_true_all, y_pred_all)
-    print("[METRIC] Full timeline:")
-    print(f"         TP={m_all['TP']}  FP={m_all['FP']}  FN={m_all['FN']}  TN={m_all['TN']}")
-    print(f"         Precision={m_all['precision']:.4f}  Recall={m_all['recall']:.4f}  F1={m_all['f1']:.4f}  Accuracy={m_all['accuracy']:.4f}")
-
-    if train_cutoff_ts is not None:
-        post_idx = pred.index >= train_cutoff_ts
-        if post_idx.any():
-            m_post = confusion_and_scores(y_true_all[post_idx], y_pred_all[post_idx])
-            print("[METRIC] Post-training window only:")
-            print(f"         TP={m_post['TP']}  FP={m_post['FP']}  FN={m_post['FN']}  TN={m_post['TN']}")
-            print(f"         Precision={m_post['precision']:.4f}  Recall={m_post['recall']:.4f}  F1={m_post['f1']:.4f}  Accuracy={m_post['accuracy']:.4f}")
 
     if maint_windows:
         def _fmt_win(w):

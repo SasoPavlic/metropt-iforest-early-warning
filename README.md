@@ -14,7 +14,7 @@ This project ingests the raw MetroPT telemetry, engineers rolling statistical fe
 4. **Isolation Forest** – `iforest_model.train_iforest_and_score` trains on the first `TRAIN_FRAC` slice, standardises features, smooths anomaly scores (optional LPF), and labels points using `Q3 + 3·IQR`.
 5. **Maintenance context** – `build_operation_phase` encodes states (0 normal, 1 pre-maintenance, 2 maintenance). `maintenance_risk` is the rolling average of anomaly exceedances over `RISK_WINDOW_MINUTES` minutes and serves as the early-warning signal.
 6. **Risk threshold search** – `iforest_metrics.evaluate_risk_thresholds` tries a grid (`RISK_EVAL_GRID_SPEC`) and reports precision/recall/F1 along with TP/FP/FN counts for alarms versus maintenance windows.
-7. **Outputs** – `metropt3_iforest_pred.csv` (opt.) with scores, risk, and phase per timestamp, `metropt3_iforest_raw.png` showing the risk timeline with failures, plus console metrics for the full history and post-training period.
+7. **Outputs** – `metropt3_iforest_features.csv` (opt.) with the engineered rolling stats, `metropt3_iforest_pred.csv` (opt.) with scores/risk/phase, `metropt3_iforest_raw.png` showing the risk timeline with failures, plus console `[INFO]` model settings and `[RISK]` summaries.
 
 ### Requirements
 ```
@@ -45,13 +45,12 @@ Command-line arguments are not required, but you can tweak configuration constan
 - `anomaly_iforest_helper.py` – main workflow runner (loading → features → model → risk → plotting).
 - `iforest_data.py` – CSV ingestion, resampling, feature engineering, maintenance-window parsing.
 - `iforest_model.py` – IsolationForest model wrapper and low-pass filtering.
-- `iforest_metrics.py` – confusion matrix utilities and event-level risk evaluation.
+- `iforest_metrics.py` – event-level maintenance risk evaluation.
 - `iforest_plotting.py` – visualisation of risk states, training cutoff, and maintenance windows.
 
 ### Output Interpretation
 - `operation_phase`: 0 normal, 1 within 2 h before a known maintenance start, 2 during maintenance.
 - `maintenance_risk`: fraction of the last `RISK_WINDOW_MINUTES` with anomaly scores above the learned threshold; higher values indicate sustained alarms and are compared against the risk threshold grid.
-- `[METRIC]` console block: point-wise performance of `is_anomaly` against failure windows.
 - `[RISK]` console block: event-level performance of the rolling risk alarm (TP/FP/FN refer to maintenance events and alarm intervals, not individual rows).
 
 ### Large Files
