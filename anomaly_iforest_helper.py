@@ -28,8 +28,8 @@ from iforest_data import (
     select_numeric_features,
     top_k_by_variance,
 )
-from iforest_metrics import evaluate_risk_thresholds
-from iforest_model import train_iforest_and_score
+from iforest_metrics import confusion_and_scores, evaluate_risk_thresholds
+from iforest_model import train_iforest_and_score, train_iforest_on_slices
 from iforest_plotting import plot_raw_timeline
 
 
@@ -64,12 +64,15 @@ SAVE_FIG_PATH: Optional[str] = "metropt3_iforest_raw.png"
 SAVE_PRED_CSV_PATH: Optional[str] = "metropt3_iforest_pred.csv"
 SAVE_FEATURES_CSV_PATH: Optional[str] = "metropt3_iforest_features.csv"
 
+# Experiment mode: "single" (global model) or "daily" (per-day adaptive models)
+EXPERIMENT_MODE: str = "single"
+
 # Optional time-based pre-downsampling rule (e.g., '60s') to regularize cadence before feature building; None disables.
 PRE_DOWNSAMPLE_RULE: Optional[str] = None
 # Rolling window for feature aggregation (e.g., '600s' = 10 minutes).
 ROLLING_WINDOW: str = "60s"
 # Fraction of earliest data used to train the IsolationForest.
-TRAIN_FRAC: float = 0.03
+TRAIN_FRAC: float = 0.3
 # Limit of most-variable base numeric features to keep before rolling aggregation.
 MAX_BASE_FEATURES: int = 12
 # Exclude near-binary numeric columns from features to focus on informative signals.
@@ -136,37 +139,135 @@ DEFAULT_METROPT_WINDOWS: List[Tuple[str, str, str, str]] = [
 ]
 
 
-def main() -> None:
-    # 1) Load raw (CSV-only)
+def _build_features_and_context() -> Tuple[pd.DataFrame, List[Tuple], pd.Series]:
+    """Load raw data, engineer rolling features, and build maintenance context."""
     df_raw = load_csv(INPUT_PATH, INPUT_TIMESTAMP_COL, drop_unnamed=DROP_UNNAMED_INDEX)
 
-    # 2) Pre-downsample (optional) before feature building
+    # Optional pre-downsample before feature building
     df_ds = pre_downsample(df_raw, PRE_DOWNSAMPLE_RULE)
 
-    # 3) Base numeric features (exclude quasi-binary, then top-K by variance)
+    # Base numeric features (optionally exclude quasi-binary, then top-K by variance)
     base_feats = select_numeric_features(
-        df_ds, prefer=LIKELY_METROPT_FEATURES, exclude_quasi_binary=EXCLUDE_QUASI_BINARY
+        df_ds,
+        prefer=LIKELY_METROPT_FEATURES,
+        exclude_quasi_binary=EXCLUDE_QUASI_BINARY,
     )
     if not base_feats:
         raise ValueError("No numeric features found after binary exclusion.")
     df_base = top_k_by_variance(df_ds[base_feats].copy(), MAX_BASE_FEATURES)
 
-    # 4) Rolling features on the compact set
+    # Rolling features on the compact set
     X = build_rolling_features(df_base, rolling_window=ROLLING_WINDOW)
     if SAVE_FEATURES_CSV_PATH:
         feats_out = X.copy()
         feats_out.index.name = "timestamp"
         feats_out.to_csv(SAVE_FEATURES_CSV_PATH)
 
-    # 5) Train IF + score (with optional LPF on scores)
-    pred, info = train_iforest_and_score(
+    # Maintenance windows + operation phase feature (0=normal,1=pre-maint,2=maintenance)
+    maint_windows = parse_maintenance_windows(
+        windows=None,
+        maintenance_csv=None,
+        use_default_windows=USE_DEFAULT_METROPT_WINDOWS,
+        default_windows=DEFAULT_METROPT_WINDOWS,
+    )
+    operation_phase = build_operation_phase(
+        index=X.index,
+        windows=maint_windows,
+        pre_hours=PRE_MAINTENANCE_HOURS,
+    ).astype(np.int8)
+
+    return X, maint_windows, operation_phase
+
+
+def _compute_pointwise_metrics(
+    is_anomaly: pd.Series,
+    operation_phase: pd.Series,
+    eval_mask: Optional[pd.Series] = None,
+) -> dict:
+    """Compute confusion metrics with labels from operation_phase (1=pre-maint,0=normal)."""
+    op_phase = operation_phase.reindex(is_anomaly.index)
+    base_mask = op_phase.isin([0, 1]) & is_anomaly.notna()
+    if eval_mask is not None:
+        eval_mask = eval_mask.reindex(is_anomaly.index).fillna(False)
+        mask = base_mask & eval_mask
+    else:
+        mask = base_mask
+
+    if not mask.any():
+        return {
+            "TP": 0,
+            "FP": 0,
+            "FN": 0,
+            "TN": 0,
+            "precision": 0.0,
+            "recall": 0.0,
+            "f1": 0.0,
+            "accuracy": 0.0,
+        }
+
+    y_true = (op_phase[mask] == 1).astype(int)
+    y_pred = is_anomaly[mask].astype(int)
+    return confusion_and_scores(y_true, y_pred)
+
+
+def _evaluate_risk_series(
+    maintenance_risk: pd.Series,
+    maint_windows: List[Tuple],
+    tag: str,
+) -> Tuple[Optional[float], Optional[pd.Series], List[dict]]:
+    """Grid-search risk thresholds and print event-level metrics."""
+    risk_thresholds: List[float] = []
+    risk_alarm_mask: Optional[pd.Series] = None
+    best_risk_threshold: Optional[float] = None
+    try:
+        risk_thresholds = parse_risk_grid_spec(RISK_EVAL_GRID_SPEC)
+    except ValueError as exc:
+        print(f"[WARN] Skipping maintenance_risk evaluation: {exc}")
+    if risk_thresholds:
+        risk_results = evaluate_risk_thresholds(
+            risk=maintenance_risk,
+            maintenance_windows=maint_windows,
+            thresholds=risk_thresholds,
+            early_warning_minutes=EARLY_WARNING_MINUTES,
+        )
+        if risk_results:
+            print(
+                f"[{tag}] Rolling window={RISK_WINDOW_MINUTES} min, early-warning horizon={EARLY_WARNING_MINUTES} min"
+            )
+            for res in risk_results:
+                print(
+                    f"[{tag}] θ={res['threshold']:.2f}  Precision={res['precision']:.4f}  "
+                    f"Recall={res['recall']:.4f}  F1={res['f1']:.4f}  TP={res['tp']}  FP={res['fp']}  FN={res['fn']}"
+                )
+            best = max(risk_results, key=lambda r: (r["f1"], r["precision"], -r["threshold"]))
+            print(
+                f"[{tag}] Best θ={best['threshold']:.2f}: Precision={best['precision']:.4f}  "
+                f"Recall={best['recall']:.4f}  F1={best['f1']:.4f}  "
+                f"TP={best['tp']}  FP={best['fp']}  FN={best['fn']}"
+            )
+            best_risk_threshold = float(best["threshold"])
+            risk_alarm_mask = (maintenance_risk >= best_risk_threshold).astype(bool)
+    else:
+        risk_results = []
+
+    return best_risk_threshold, risk_alarm_mask, risk_results
+
+
+def _run_single_model_experiment(
+    X: pd.DataFrame,
+    maint_windows: List[Tuple],
+    operation_phase: pd.Series,
+) -> Tuple[pd.DataFrame, dict, Optional[pd.Timestamp], Optional[float], Optional[pd.Series]]:
+    """Baseline: single global IF model trained once and scored over the full timeline."""
+    pred_if, info = train_iforest_and_score(
         X=X,
         train_frac=TRAIN_FRAC,
         lpf_alpha=LPF_ALPHA,
     )
 
+    pred = pred_if.copy()
+
     # Rolling maintenance risk from exceedance of the training threshold
-    risk_window_minutes = RISK_WINDOW_MINUTES
     score_for_risk = (
         pred["anom_score_lpf"] if "anom_score_lpf" in pred.columns else pred["anom_score"]
     ).astype(float).fillna(0.0)
@@ -182,76 +283,197 @@ def main() -> None:
             tau = float(np.percentile(finite, 75)) if finite.size else 0.0
     exceedance = (score_for_risk >= float(tau)).astype(float)
     maintenance_risk = (
-        exceedance.rolling(f"{risk_window_minutes}min", min_periods=1).mean().astype(np.float32).fillna(0.0)
+        exceedance.rolling(f"{RISK_WINDOW_MINUTES}min", min_periods=1)
+        .mean()
+        .astype(np.float32)
+        .fillna(0.0)
     ).rename("maintenance_risk")
     pred["maintenance_risk"] = maintenance_risk
+    pred["operation_phase"] = operation_phase.reindex(pred.index).astype(np.int8)
 
-    # 6) Maintenance windows + operation phase feature
-    maint_windows = parse_maintenance_windows(
-        windows=None,
-        maintenance_csv=None,
-        use_default_windows=USE_DEFAULT_METROPT_WINDOWS,
-        default_windows=DEFAULT_METROPT_WINDOWS,
-    )
-    operation_phase = build_operation_phase(
-        index=pred.index,
-        windows=maint_windows,
-        pre_hours=PRE_MAINTENANCE_HOURS,
-    )
-    operation_phase = operation_phase.astype(np.int8)
-    pred["operation_phase"] = operation_phase
     # Event-level evaluation of maintenance_risk thresholds
-    risk_thresholds: List[float] = []
-    risk_alarm_mask: Optional[pd.Series] = None
-    best_risk_threshold: Optional[float] = None
-    risk_thresholds = []
-    try:
-        risk_thresholds = parse_risk_grid_spec(RISK_EVAL_GRID_SPEC)
-    except ValueError as exc:
-        print(f"[WARN] Skipping maintenance_risk evaluation: {exc}")
-    if risk_thresholds:
-        risk_results = evaluate_risk_thresholds(
-            risk=maintenance_risk,
-            maintenance_windows=maint_windows,
-            thresholds=risk_thresholds,
-            early_warning_minutes=EARLY_WARNING_MINUTES,
-        )
-        if risk_results:
-            print(
-                f"[RISK] Rolling window={risk_window_minutes} min, early-warning horizon={EARLY_WARNING_MINUTES} min"
-            )
-            for res in risk_results:
-                print(
-                    f"[RISK] θ={res['threshold']:.2f}  Precision={res['precision']:.4f}  "
-                    f"Recall={res['recall']:.4f}  F1={res['f1']:.4f}  TP={res['tp']}  FP={res['fp']}  FN={res['fn']}"
-            )
-            best = max(risk_results, key=lambda r: (r["f1"], r["precision"], -r["threshold"]))
-            print(
-                f"[RISK] Best θ={best['threshold']:.2f}: Precision={best['precision']:.4f}  "
-                f"Recall={best['recall']:.4f}  F1={best['f1']:.4f}  "
-                f"TP={best['tp']}  FP={best['fp']}  FN={best['fn']}"
-            )
-            best_risk_threshold = float(best["threshold"])
-            risk_alarm_mask = (maintenance_risk >= best_risk_threshold).astype(bool)
-
-    # 7b) Minimal frame for plotting (contains maintenance_risk timeline)
-    df_plot = pred[["maintenance_risk"]].copy()
+    best_risk_threshold, risk_alarm_mask, _ = _evaluate_risk_series(
+        maintenance_risk, maint_windows, tag="RISK"
+    )
 
     # Exact training cutoff timestamp on the prediction index
-    train_cutoff_ts = None
+    train_cutoff_ts: Optional[pd.Timestamp] = None
     try:
         if info.get("n_train", 0) > 0 and info["n_train"] <= len(pred.index):
             train_cutoff_ts = pred.index[info["n_train"] - 1]
     except Exception:
         train_cutoff_ts = None
 
-    # Decide labeling default: constants-based
+    # Point-wise metrics on normal + pre-maintenance
+    m_all = _compute_pointwise_metrics(pred["is_anomaly"], pred["operation_phase"])
+    print("[METRIC] Single-model (all evaluated rows):")
+    print(
+        f"         TP={m_all['TP']}  FP={m_all['FP']}  FN={m_all['FN']}  TN={m_all['TN']}"
+    )
+    print(
+        f"         Precision={m_all['precision']:.4f}  Recall={m_all['recall']:.4f}  "
+        f"F1={m_all['f1']:.4f}  Accuracy={m_all['accuracy']:.4f}"
+    )
+
+    # Console summary
+    total_pts = int(pred["is_anomaly"].sum())
+    pct_pts = float(100.0 * pred["is_anomaly"].mean())
+    print(
+        f"[INFO] Model rule: {info['label_rule']}, features={info['n_features']}, LPF alpha={info['lpf_alpha']}"
+    )
+    print(f"[INFO] Train size: {info['n_train']}/{info['n_total']}")
+    print(f"[INFO] Point anomalies: {total_pts} ({pct_pts:.2f}%)")
+    if info.get("threshold") is not None:
+        print(f"[INFO] Train-based threshold: {info['threshold']:.4f}")
+
+    return pred, info, train_cutoff_ts, best_risk_threshold, risk_alarm_mask
+
+
+def _run_daily_models_experiment(
+    X: pd.DataFrame,
+    maint_windows: List[Tuple],
+    operation_phase: pd.Series,
+) -> Tuple[pd.DataFrame, dict, Optional[float], Optional[pd.Series]]:
+    """
+    Adaptive regime: train a new IF model for each calendar day, using all data
+    up to the previous day as training, and evaluate day-by-day.
+    """
+    index = X.index
+    day_periods = index.to_period("D")
+    unique_days = day_periods.unique().sort_values()
+    if len(unique_days) < 2:
+        raise ValueError("Daily-mode requires at least two calendar days of data.")
+
+    pred = pd.DataFrame(index=index)
+    exceedance = pd.Series(index=index, dtype=float)
+
+    daily_infos: List[dict] = []
+
+    # First day is used only as training history; daily evaluation starts at second day.
+    n_test_days = len(unique_days) - 1
+    print(
+        f"[INFO] Daily mode: {n_test_days} test days "
+        f"(skipping initial training-only day {unique_days[0]})"
+    )
+
+    for day_idx, day in enumerate(unique_days[1:], start=1):
+        train_mask = day_periods < day
+        test_mask = day_periods == day
+        if not train_mask.any() or not test_mask.any():
+            continue
+
+        X_train = X.loc[train_mask]
+        X_test = X.loc[test_mask]
+
+        print(
+            f"[INFO] Daily model {day_idx}/{n_test_days} for day {day}: "
+            f"train_size={X_train.shape[0]}, test_size={X_test.shape[0]}"
+        )
+
+        # Train on all history up to previous day, score only current day.
+        slice_pred, info = train_iforest_on_slices(
+            X_train=X_train,
+            X_all=X_test,
+            lpf_alpha=LPF_ALPHA,
+            random_state=42,
+        )
+        daily_infos.append({"day": str(day), **info})
+
+        pred.loc[test_mask, "anom_score"] = slice_pred["anom_score"]
+        if "anom_score_lpf" in slice_pred.columns:
+            pred.loc[test_mask, "anom_score_lpf"] = slice_pred["anom_score_lpf"]
+        pred.loc[test_mask, "is_anomaly"] = slice_pred["is_anomaly"]
+
+        score_for_risk = (
+            slice_pred["anom_score_lpf"]
+            if "anom_score_lpf" in slice_pred.columns
+            else slice_pred["anom_score"]
+        ).astype(float).fillna(0.0)
+        tau = info.get("threshold")
+        if tau is None:
+            q3 = info.get("q3")
+            iqr = info.get("iqr")
+            if q3 is not None and iqr is not None:
+                tau = float(q3 + 3.0 * iqr)
+            else:
+                finite = score_for_risk.to_numpy()
+                finite = finite[np.isfinite(finite)]
+                tau = float(np.percentile(finite, 75)) if finite.size else 0.0
+        exceedance_slice = (score_for_risk >= float(tau)).astype(float)
+        exceedance.loc[test_mask] = exceedance_slice
+
+    # Any points with no exceedance value (e.g., initial training-only days) are treated as zero risk.
+    exceedance = exceedance.fillna(0.0)
+    maintenance_risk = (
+        exceedance.rolling(f"{RISK_WINDOW_MINUTES}min", min_periods=1)
+        .mean()
+        .astype(np.float32)
+        .fillna(0.0)
+    ).rename("maintenance_risk")
+    pred["maintenance_risk"] = maintenance_risk
+    pred["operation_phase"] = operation_phase.reindex(pred.index).astype(np.int8)
+
+    # Event-level evaluation of maintenance_risk thresholds
+    best_risk_threshold, risk_alarm_mask, _ = _evaluate_risk_series(
+        maintenance_risk, maint_windows, tag="RISK-DAILY"
+    )
+
+    # Point-wise metrics on days with predictions (normal + pre-maintenance only)
+    eval_mask = pred["is_anomaly"].notna()
+    m_all = _compute_pointwise_metrics(pred["is_anomaly"], pred["operation_phase"], eval_mask=eval_mask)
+    print("[METRIC] Daily-model (all evaluated rows across days):")
+    print(
+        f"         TP={m_all['TP']}  FP={m_all['FP']}  FN={m_all['FN']}  TN={m_all['TN']}"
+    )
+    print(
+        f"         Precision={m_all['precision']:.4f}  Recall={m_all['recall']:.4f}  "
+        f"F1={m_all['f1']:.4f}  Accuracy={m_all['accuracy']:.4f}"
+    )
+
+    # Summary of daily training sizes
+    if daily_infos:
+        n_days = len(daily_infos)
+        min_train = min(info["n_train"] for info in daily_infos)
+        max_train = max(info["n_train"] for info in daily_infos)
+        print(
+            f"[INFO] Daily models: {n_days} test days, training size range={min_train}..{max_train}"
+        )
+
+    summary_info = {
+        "mode": "daily",
+        "n_days": len(daily_infos),
+    }
+    return pred, summary_info, best_risk_threshold, risk_alarm_mask
+
+
+def main() -> None:
+    # 1) Build rolling feature matrix and maintenance context
+    X, maint_windows, operation_phase = _build_features_and_context()
+
+    # 2) Run the selected experiment mode
+    mode = EXPERIMENT_MODE.lower().strip()
+    if mode not in {"single", "daily"}:
+        raise ValueError(f"Unsupported EXPERIMENT_MODE={EXPERIMENT_MODE!r}; use 'single' or 'daily'.")
+
+    if mode == "single":
+        pred, info, train_cutoff_ts, best_risk_threshold, risk_alarm_mask = _run_single_model_experiment(
+            X, maint_windows, operation_phase
+        )
+    else:
+        pred, info, best_risk_threshold, risk_alarm_mask = _run_daily_models_experiment(
+            X, maint_windows, operation_phase
+        )
+        train_cutoff_ts = None
+
+    # 3) Plot risk timeline
+    df_plot = pred[["maintenance_risk"]].copy()
+
     effective_show_labels = bool(SHOW_WINDOW_LABELS or USE_DEFAULT_METROPT_WINDOWS)
     plot_raw_timeline(
         df_plot,
         maint_windows,
         save_fig=SAVE_FIG_PATH,
-        train_frac=TRAIN_FRAC,
+        train_frac=TRAIN_FRAC if mode == "single" else None,
         train_cutoff_time=train_cutoff_ts,
         show_window_labels=effective_show_labels,
         window_label_fontsize=WINDOW_LABEL_FONTSIZE,
@@ -261,20 +483,11 @@ def main() -> None:
         early_warning_minutes=EARLY_WARNING_MINUTES,
     )
 
-    # 9) Optional: save per-point predictions (timestamp, score, is_anomaly)
+    # 4) Optional: save per-point predictions (timestamp, score, labels, risk)
     if SAVE_PRED_CSV_PATH:
         out = pred.copy()
         out.index.name = "timestamp"
         out.to_csv(SAVE_PRED_CSV_PATH)
-
-    # --------- 10) Console summary + metrics ----------
-    total_pts = int(pred["is_anomaly"].sum())
-    pct_pts = float(100.0 * pred["is_anomaly"].mean())
-    print(f"[INFO] Model rule: {info['label_rule']}, features={info['n_features']}, LPF alpha={info['lpf_alpha']}")
-    print(f"[INFO] Train size: {info['n_train']}/{info['n_total']}")
-    print(f"[INFO] Point anomalies: {total_pts} ({pct_pts:.2f}%)")
-    if info["threshold"] is not None:
-        print(f"[INFO] Train-based threshold: {info['threshold']:.4f}")
 
     if maint_windows:
         def _fmt_win(w):
