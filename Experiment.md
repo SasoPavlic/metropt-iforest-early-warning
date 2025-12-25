@@ -1,9 +1,5 @@
 ## MetroPT-IForest Experiments (opis workflowa)
 
-Ta dokument v razumljivem jeziku razlozi, kako program bere podatke, kako gradi znacilke, kako trenira modele in kako izracuna dve vrsti anomalij (point‑wise in collective). Opis je 1:1 skladen z aktualno kodo.
-
----
-
 ## 1) Branje in priprava podatkov
 
 ### Kakšni so podatki v CSV
@@ -14,7 +10,7 @@ MetroPT3 vsebuje casovne vrste iz tramvaja (APU). V stolpcih se pojavljajo:
 
 Program CSV prebere, `timestamp` uredi in nastavi kot indeks.
 
-### PRE_DOWNSAMPLE_RULE (opcijsko)
+### PRE_DOWNSAMPLE_RULE (opcijsko, tako imajo v članku MetroPT)
 `PRE_DOWNSAMPLE_RULE` je pravilo resamplinga (npr. `"60s"`). Ce je nastavljen:
 - podatke agregiramo na enakomeren casovni korak,
 - v vsakem intervalu vzamemo median.
@@ -118,7 +114,7 @@ Potem je veljavno okno za TP:
 
 ## Scoring
 - Model oceni **vse** vrstice.
-- `anom_score` je osnovni IF score; `anom_score_lpf` je opcijsko glajenje (LPF), ki zmanjsa sum in kratke spike.
+- `anom_score` je osnovni IF score; `anom_score_lpf` je opcijsko glajenje (LPF), ki zmanjsa sum in kratke spike. (Tako so imeli v članku)
 
 ## Evaluacija
 Point‑wise in event‑level logika je enaka kot zgoraj.  
@@ -133,7 +129,7 @@ Za fer primerjavo se izlocijo tudi post‑maintenance ucni intervali.
 - Ta baseline je **vedno** del ucnih podatkov vsakega per‑maint modela.
 - To **ni fine‑tuning**; vsak model se uci znova na (baseline + lokalni interval).
 
-## Oznake (da bo zapis jasno sledljiv)
+## Legenda oznak
 - `Wj` = j‑ti servisni interval  
 - `start_j`, `end_j` = zacetek in konec servisa  
 - `gap` = interval `(end_j, start_{j+1})`  
@@ -171,7 +167,7 @@ Event‑level logika je **enaka** kot pri single, ker:
 
 ---
 
-# Ključne razlike (kratko in pregledno)
+# Ključne razlike
 
 | Lastnost | Single | Per‑maintenance |
 |---|---|---|
@@ -183,7 +179,7 @@ Event‑level logika je **enaka** kot pri single, ker:
 
 ---
 
-# Rezultati (zadnji tek)
+# Rezultati
 
 ### Event‑level (Best θ)
 | Regime | Tag | θ | TP | FP | FN | Precision | Recall | F1 |
@@ -199,7 +195,7 @@ Event‑level logika je **enaka** kot pri single, ker:
 
 ---
 
-# Vizualizacija (mentalni model)
+# Vizualizacija
 
 Single:
 ```
