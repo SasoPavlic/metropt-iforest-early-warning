@@ -15,6 +15,26 @@ import pandas as pd
 from matplotlib.patches import Patch
 
 
+def _risk_alarm_label(
+    risk_threshold: Optional[float],
+    evaluation_coverage_fraction: Optional[float],
+) -> str:
+    """Format the plot label from the authoritative event-evaluation coverage."""
+    if risk_threshold is None:
+        return "Risk alarm"
+
+    label = f"Risk alarm (≥ θ={float(risk_threshold):.2f}"
+    if evaluation_coverage_fraction is None:
+        return f"{label})"
+
+    coverage = float(evaluation_coverage_fraction)
+    if not np.isfinite(coverage) or not 0.0 <= coverage <= 1.0:
+        raise ValueError(
+            "evaluation_coverage_fraction must be finite and within [0, 1]."
+        )
+    return f"{label}, {coverage * 100.0:.1f}% evaluation coverage)"
+
+
 def plot_raw_timeline(
         df_plot: pd.DataFrame,
         maintenance_windows: List[Tuple],
@@ -25,6 +45,7 @@ def plot_raw_timeline(
         window_label_fontsize: int = 9,
         window_label_format: str = "{id}",
         predicted_phase: Optional[pd.Series] = None,
+        evaluation_coverage_fraction: Optional[float] = None,
         risk_threshold: Optional[float] = None,
         early_warning_minutes: float = 120.0,
         detector_name: Optional[str] = None,
@@ -51,10 +72,7 @@ def plot_raw_timeline(
         label="Normal",
         zorder=0,
     )
-    coverage = float(state.mean() * 100.0) if len(state) else 0.0
-    risk_label = "Risk alarm"
-    if risk_threshold is not None:
-        risk_label = f"Risk alarm (≥ θ={risk_threshold:.2f}, {coverage:.1f}% coverage)"
+    risk_label = _risk_alarm_label(risk_threshold, evaluation_coverage_fraction)
     ax.fill_between(
         df_plot.index,
         0,

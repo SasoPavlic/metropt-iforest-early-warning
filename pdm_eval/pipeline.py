@@ -425,7 +425,7 @@ SAVE_FIG_PATH: Optional[str] = "metropt3_raw.png"
 SAVE_LEAD_TIME_DIST_PATH: Optional[str] = "lead_time_distribution.png"
 SAVE_PR_LEADTIME_PATH: Optional[str] = "pr_vs_lead_time.png"
 SAVE_PRED_CSV_PATH: Optional[str] = "metropt3_predictions.csv"
-SAVE_FEATURES_CSV_PATH: Optional[str] = "datasets/metropt3_features.csv"
+SAVE_FEATURES_CSV_PATH: Optional[str] = None
 
 # Experiment mode:
 # - "single": one global model trained once on an early slice.
@@ -435,7 +435,7 @@ EXPERIMENT_MODE: str = "per_maint"
 
 # Pretrained per-maint model handoff (manifest-driven)
 PER_MAINT_USE_IMPORTED_MODELS: bool = True
-PER_MAINT_MODEL_MANIFEST_PATH: Optional[str] = r'C:\Users\sasop\CodexProjects\nianet\NiaNetVAE\logs\per_maint_vae_finetune_alarm_burden\MetroPT\cycle_manifest.json'
+PER_MAINT_MODEL_MANIFEST_PATH: Optional[str] = r'C:\Users\sasop\CodexProjects\nianet\NiaNetVAE\logs\per_maint_vae_finetune_alarm_burden_200plus\MetroPT\cycle_manifest.json'
 PER_MAINT_MODEL_STRICT: bool = True
 
 # Detector backend for local training ("iforest", "recurrent-vae", "recurrent-sae")
@@ -2017,6 +2017,11 @@ def main() -> None:
     effective_show_labels = bool(SHOW_WINDOW_LABELS or USE_DEFAULT_METROPT_WINDOWS)
     save_fig_path = _output_path_with_detector(SAVE_FIG_PATH, mode, effective_detector)
     detector_label = _detector_display_label(effective_detector)
+    evaluation_coverage_fraction = (
+        ((info.get("event_metrics") or {}).get("coverage") or {}).get(
+            "alarm_coverage"
+        )
+    )
     plot_raw_timeline(
         df_plot,
         maint_windows,
@@ -2027,6 +2032,7 @@ def main() -> None:
         window_label_fontsize=WINDOW_LABEL_FONTSIZE,
         window_label_format=WINDOW_LABEL_FORMAT,
         predicted_phase=predicted_phase,
+        evaluation_coverage_fraction=evaluation_coverage_fraction,
         risk_threshold=best_risk_threshold,
         early_warning_minutes=PRE_MAINTENANCE_MINUTES,
         detector_name=detector_label,

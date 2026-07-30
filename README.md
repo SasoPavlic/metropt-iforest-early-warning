@@ -66,7 +66,7 @@ For local recurrent reconstruction baselines inside the current framework, set:
 1. `EXPERIMENT_MODE="single"`.
 2. `DETECTOR_TYPE="recurrent-vae"` or `DETECTOR_TYPE="recurrent-sae"`.
 
-Both detectors use the same combined analog+digital rolling feature matrix and a shared LSTM sequence setup: sequence length `200`, stride `1`, hidden size `64`, two recurrent layers, latent dimension `32`, Adam, learning rate `0.003`, batch size `64`, and training-split standardization. The VAE uses stochastic latent sampling with KL beta `0.1`; the SAE uses deterministic sparse latent activations with KL sparsity beta/rho defaults in `metropt_pdm_framework/pipeline.py`.
+Both detectors use the same combined analog+digital rolling feature matrix and a shared LSTM sequence setup: sequence length `200`, stride `1`, hidden size `64`, two recurrent layers, latent dimension `32`, Adam, learning rate `0.003`, batch size `64`, and training-split standardization. The VAE uses stochastic latent sampling with KL beta `0.001`; the SAE uses deterministic sparse latent activations with KL sparsity beta/rho defaults in `pdm_eval/pipeline.py`.
 
 ### Imported per-cycle recurrent artifacts (per_maint)
 To consume pretrained per-cycle recurrent artifacts exported from `NiaNetVAE`:
