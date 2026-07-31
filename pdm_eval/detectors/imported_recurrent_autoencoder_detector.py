@@ -20,6 +20,13 @@ from .base import BaseDetector
 
 
 ARTIFACT_CONTRACT_VERSION = "2.0"
+LEGACY_PREPROCESSING_POLICY = "standard_scaler_v1"
+BINARY_AWARE_PREPROCESSING_POLICY = "binary_passthrough_v1"
+PREPROCESSING_POLICY_VERSION = "1.0"
+SUPPORTED_PREPROCESSING_POLICIES = {
+    LEGACY_PREPROCESSING_POLICY,
+    BINARY_AWARE_PREPROCESSING_POLICY,
+}
 
 
 class ImportedArtifactContractError(ValueError):
@@ -57,7 +64,90 @@ def _scaler_state_payload(scaler: object) -> dict:
     for attr in ("mean_", "scale_", "var_", "n_features_in_", "n_samples_seen_"):
         if hasattr(scaler, attr):
             payload[attr] = _as_jsonable(getattr(scaler, attr))
+    for attr in (
+        "nianetvae_preprocessing_policy_",
+        "nianetvae_preprocessing_policy_version_",
+        "nianetvae_passthrough_indices_",
+    ):
+        if hasattr(scaler, attr):
+            payload[attr] = _as_jsonable(getattr(scaler, attr))
     return payload
+
+
+def _ordered_int_list(values: object) -> list[int]:
+    return [int(value) for value in _normalize_list(values)]
+
+
+def _string_list(values: object) -> list[str]:
+    return [str(value) for value in _normalize_list(values)]
+
+
+def _resolve_preprocessing_policy_summary(
+    preprocessing_contract: dict,
+) -> tuple[str, str, bool]:
+    """Return policy, version, and whether the versioned policy was explicit."""
+    explicit = "policy" in preprocessing_contract
+    policy = str(
+        preprocessing_contract.get("policy") or LEGACY_PREPROCESSING_POLICY
+    ).strip().lower()
+    if policy not in SUPPORTED_PREPROCESSING_POLICIES:
+        raise ImportedArtifactContractError(
+            f"Unsupported imported preprocessing policy={policy!r}."
+        )
+    version = str(
+        preprocessing_contract.get("policy_version") or PREPROCESSING_POLICY_VERSION
+    )
+    if version != PREPROCESSING_POLICY_VERSION:
+        raise ImportedArtifactContractError(
+            "Unsupported imported preprocessing policy version: "
+            f"policy={policy!r}, version={version!r}; "
+            f"expected version={PREPROCESSING_POLICY_VERSION!r}."
+        )
+    return policy, version, explicit
+
+
+def _preprocessing_contract_hash_payload(contract: dict) -> dict:
+    policy, version, _explicit = _resolve_preprocessing_policy_summary(contract)
+    return {
+        "policy": policy,
+        "policy_version": version,
+        "behavior": contract.get("behavior"),
+        "preserves_feature_order": contract.get("preserves_feature_order", True),
+        "preserves_feature_count": contract.get("preserves_feature_count", True),
+        "configured_binary_feature_names": _string_list(
+            contract.get("configured_binary_feature_names")
+        ),
+        "matched_binary_feature_names": _string_list(
+            contract.get("matched_binary_feature_names")
+        ),
+        "binary_derived_feature_indices": _ordered_int_list(
+            contract.get("binary_derived_feature_indices")
+        ),
+        "binary_derived_feature_names": _string_list(
+            contract.get("binary_derived_feature_names")
+        ),
+        "binary_derived_feature_count": int(
+            contract.get("binary_derived_feature_count") or 0
+        ),
+        "applied_binary_feature_names": _string_list(
+            contract.get("applied_binary_feature_names")
+        ),
+        "passthrough_feature_indices": _ordered_int_list(
+            contract.get("passthrough_feature_indices")
+        ),
+        "passthrough_feature_names": _string_list(
+            contract.get("passthrough_feature_names")
+        ),
+        "passthrough_feature_count": int(
+            contract.get("passthrough_feature_count") or 0
+        ),
+        "standardized_feature_indices": _ordered_int_list(
+            contract.get("standardized_feature_indices")
+        ),
+        "standardized_feature_count": int(
+            contract.get("standardized_feature_count") or 0
+        ),
+    }
 
 
 def _normalize_list(values: object) -> list:
@@ -185,6 +275,8 @@ class ImportedRecurrentAutoencoderDetector(BaseDetector):
         self._validate_runtime_contract()
         print(
             "[INFO] Imported recurrent artifact contract v2 validated; "
+            f"preprocessing_policy={self.preprocessing_policy} "
+            f"passthrough_features={len(_normalize_list(self.preprocessing_contract.get('passthrough_feature_indices')))} "
             f"using exported scaler={self.scaler_path}"
         )
         self.model = self._build_model()
@@ -246,6 +338,11 @@ class ImportedRecurrentAutoencoderDetector(BaseDetector):
             raise ImportedArtifactContractError(
                 "Imported artifact scaler_feature_count does not match rolling_feature_names length."
             )
+        self._validate_preprocessing_metadata(
+            feature_contract=feature_contract,
+            preprocessing_contract=preprocessing_contract,
+            rolling_feature_names=[str(name) for name in rolling_feature_names],
+        )
 
         sequence_contract = self.meta["sequence_contract"]
         if not sequence_contract.get("seq_len") or not sequence_contract.get("stride"):
@@ -256,6 +353,195 @@ class ImportedRecurrentAutoencoderDetector(BaseDetector):
             raise ImportedArtifactContractError(
                 "Imported artifact must declare cross_gap_windows_allowed=False."
             )
+
+    def _validate_preprocessing_metadata(
+        self,
+        *,
+        feature_contract: dict,
+        preprocessing_contract: dict,
+        rolling_feature_names: list[str],
+    ) -> None:
+        policy, version, explicit = _resolve_preprocessing_policy_summary(
+            preprocessing_contract
+        )
+        self.preprocessing_policy = policy
+        self.preprocessing_policy_version = version
+        self.preprocessing_policy_explicit = explicit
+
+        if not explicit:
+            # Contract-v2 artifacts produced before the policy extension used
+            # StandardScaler on every feature and had no passthrough metadata.
+            if (
+                preprocessing_contract.get("contract_hash")
+                or _normalize_list(preprocessing_contract.get("passthrough_feature_indices"))
+                or _normalize_list(preprocessing_contract.get("passthrough_feature_names"))
+            ):
+                raise ImportedArtifactContractError(
+                    "Legacy preprocessing metadata cannot declare a contract hash or "
+                    "binary passthrough fields without an explicit policy."
+                )
+            return
+
+        if preprocessing_contract.get("preserves_feature_order") is not True:
+            raise ImportedArtifactContractError(
+                "Imported preprocessing contract must preserve feature order."
+            )
+        if preprocessing_contract.get("preserves_feature_count") is not True:
+            raise ImportedArtifactContractError(
+                "Imported preprocessing contract must preserve feature count."
+            )
+
+        expected_contract_hash = preprocessing_contract.get("contract_hash")
+        if not expected_contract_hash:
+            raise ImportedArtifactContractError(
+                "Versioned imported preprocessing contract is missing contract_hash."
+            )
+        observed_contract_hash = _json_hash(
+            _preprocessing_contract_hash_payload(preprocessing_contract)
+        )
+        if str(expected_contract_hash) != observed_contract_hash:
+            raise ImportedArtifactContractError(
+                "Imported preprocessing contract hash does not match its policy metadata."
+            )
+
+        feature_count = len(rolling_feature_names)
+        configured_binary_names = _string_list(
+            preprocessing_contract.get("configured_binary_feature_names")
+        )
+        matched_binary_names = _string_list(
+            preprocessing_contract.get("matched_binary_feature_names")
+        )
+        applied_binary_names = _string_list(
+            preprocessing_contract.get("applied_binary_feature_names")
+        )
+        binary_indices = _ordered_int_list(
+            preprocessing_contract.get("binary_derived_feature_indices")
+        )
+        binary_names = _string_list(
+            preprocessing_contract.get("binary_derived_feature_names")
+        )
+        passthrough_indices = _ordered_int_list(
+            preprocessing_contract.get("passthrough_feature_indices")
+        )
+        passthrough_names = _string_list(
+            preprocessing_contract.get("passthrough_feature_names")
+        )
+        standardized_indices = _ordered_int_list(
+            preprocessing_contract.get("standardized_feature_indices")
+        )
+
+        for label, indices in (
+            ("binary_derived_feature_indices", binary_indices),
+            ("passthrough_feature_indices", passthrough_indices),
+            ("standardized_feature_indices", standardized_indices),
+        ):
+            if indices != sorted(set(indices)):
+                raise ImportedArtifactContractError(
+                    f"Imported preprocessing {label} must be sorted and unique."
+                )
+            if any(index < 0 or index >= feature_count for index in indices):
+                raise ImportedArtifactContractError(
+                    f"Imported preprocessing {label} contains an out-of-range index."
+                )
+
+        if [rolling_feature_names[index] for index in binary_indices] != binary_names:
+            raise ImportedArtifactContractError(
+                "Imported binary-derived feature names do not match their indices and feature order."
+            )
+        if [rolling_feature_names[index] for index in passthrough_indices] != passthrough_names:
+            raise ImportedArtifactContractError(
+                "Imported passthrough feature names do not match their indices and feature order."
+            )
+
+        expected_binary_indices: list[int] = []
+        expected_matched_names: list[str] = []
+        for base_name in configured_binary_names:
+            prefix = f"{base_name}__"
+            matches = [
+                index
+                for index, feature_name in enumerate(rolling_feature_names)
+                if feature_name.startswith(prefix)
+            ]
+            if matches:
+                expected_matched_names.append(base_name)
+                expected_binary_indices.extend(matches)
+        expected_binary_indices = sorted(set(expected_binary_indices))
+        if matched_binary_names != expected_matched_names:
+            raise ImportedArtifactContractError(
+                "Imported matched binary base features do not match rolling feature names."
+            )
+        if binary_indices != expected_binary_indices:
+            raise ImportedArtifactContractError(
+                "Imported binary-derived indices do not match the declared binary base features."
+            )
+
+        feature_binary_names = _string_list(
+            feature_contract.get("binary_base_feature_names")
+        )
+        feature_binary_indices = _ordered_int_list(
+            feature_contract.get("binary_derived_feature_indices")
+        )
+        feature_binary_derived_names = _string_list(
+            feature_contract.get("binary_derived_feature_names")
+        )
+        if (
+            feature_binary_names != matched_binary_names
+            or feature_binary_indices != binary_indices
+            or feature_binary_derived_names != binary_names
+        ):
+            raise ImportedArtifactContractError(
+                "Imported feature contract and preprocessing contract disagree on binary-derived features."
+            )
+
+        if int(preprocessing_contract.get("binary_derived_feature_count") or 0) != len(binary_indices):
+            raise ImportedArtifactContractError(
+                "Imported binary-derived feature count does not match its index list."
+            )
+        if int(preprocessing_contract.get("passthrough_feature_count") or 0) != len(passthrough_indices):
+            raise ImportedArtifactContractError(
+                "Imported passthrough feature count does not match its index list."
+            )
+        if int(preprocessing_contract.get("standardized_feature_count") or 0) != len(standardized_indices):
+            raise ImportedArtifactContractError(
+                "Imported standardized feature count does not match its index list."
+            )
+
+        expected_standardized_indices = [
+            index for index in range(feature_count) if index not in set(passthrough_indices)
+        ]
+        if standardized_indices != expected_standardized_indices:
+            raise ImportedArtifactContractError(
+                "Imported standardized and passthrough indices do not partition the feature order."
+            )
+
+        if policy == BINARY_AWARE_PREPROCESSING_POLICY:
+            if preprocessing_contract.get("behavior") != (
+                "continuous_derived_standardized_binary_derived_passthrough"
+            ):
+                raise ImportedArtifactContractError(
+                    "Imported binary preprocessing behavior identifier is invalid."
+                )
+            if not binary_indices:
+                raise ImportedArtifactContractError(
+                    "Imported binary preprocessing policy must declare binary-derived features."
+                )
+            if passthrough_indices != binary_indices or passthrough_names != binary_names:
+                raise ImportedArtifactContractError(
+                    "Imported binary policy must passthrough every binary-derived feature."
+                )
+            if applied_binary_names != matched_binary_names:
+                raise ImportedArtifactContractError(
+                    "Imported binary policy applied base-feature list is inconsistent."
+                )
+        else:
+            if preprocessing_contract.get("behavior") != "all_engineered_features_standardized":
+                raise ImportedArtifactContractError(
+                    "Imported legacy preprocessing behavior identifier is invalid."
+                )
+            if passthrough_indices or passthrough_names or applied_binary_names:
+                raise ImportedArtifactContractError(
+                    "Imported legacy preprocessing policy cannot declare passthrough features."
+                )
 
     def _resolve_scaler_path(self) -> Path:
         if self.cfg.scaler_path:
@@ -288,6 +574,63 @@ class ImportedRecurrentAutoencoderDetector(BaseDetector):
                 f"Imported scaler feature count mismatch: scaler={scaler_features}, "
                 f"feature_contract={self.input_dim}."
             )
+        if self.preprocessing_policy_explicit:
+            required_attrs = (
+                "nianetvae_preprocessing_policy_",
+                "nianetvae_preprocessing_policy_version_",
+                "nianetvae_passthrough_indices_",
+            )
+            missing_attrs = [
+                attr for attr in required_attrs if not hasattr(self.scaler, attr)
+            ]
+            if missing_attrs:
+                raise ImportedArtifactContractError(
+                    "Versioned imported scaler is missing NiaNetVAE preprocessing "
+                    f"attributes: {', '.join(missing_attrs)}."
+                )
+            scaler_policy = str(
+                getattr(self.scaler, "nianetvae_preprocessing_policy_")
+            )
+            scaler_version = str(
+                getattr(self.scaler, "nianetvae_preprocessing_policy_version_")
+            )
+            scaler_passthrough_indices = _ordered_int_list(
+                getattr(self.scaler, "nianetvae_passthrough_indices_")
+            )
+            contract_passthrough_indices = _ordered_int_list(
+                self.preprocessing_contract.get("passthrough_feature_indices")
+            )
+            if scaler_policy != self.preprocessing_policy:
+                raise ImportedArtifactContractError(
+                    "Imported scaler preprocessing policy does not match model metadata."
+                )
+            if scaler_version != self.preprocessing_policy_version:
+                raise ImportedArtifactContractError(
+                    "Imported scaler preprocessing policy version does not match model metadata."
+                )
+            if scaler_passthrough_indices != contract_passthrough_indices:
+                raise ImportedArtifactContractError(
+                    "Imported scaler passthrough indices do not match model metadata."
+                )
+
+            if self.preprocessing_policy == BINARY_AWARE_PREPROCESSING_POLICY:
+                for attr, expected_value in (
+                    ("mean_", 0.0),
+                    ("scale_", 1.0),
+                    ("var_", 1.0),
+                ):
+                    if not hasattr(self.scaler, attr):
+                        raise ImportedArtifactContractError(
+                            "Imported binary passthrough scaler is missing required "
+                            f"state attribute {attr}."
+                        )
+                    values = np.asarray(getattr(self.scaler, attr), dtype=float)
+                    selected = values[np.asarray(scaler_passthrough_indices, dtype=int)]
+                    if not np.allclose(selected, expected_value, rtol=0.0, atol=0.0):
+                        raise ImportedArtifactContractError(
+                            "Imported binary passthrough scaler state is not identity "
+                            f"for {attr}."
+                        )
         expected_hash = self.preprocessing_contract.get("scaler_hash")
         if expected_hash:
             observed_hash = _json_hash(_scaler_state_payload(self.scaler))

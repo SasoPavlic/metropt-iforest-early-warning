@@ -6,7 +6,7 @@ Post-processing for detector scores (risk score, thresholds, labels).
 
 from __future__ import annotations
 
-from typing import List, Optional, Tuple
+from typing import Dict, List, Optional, Tuple
 
 import numpy as np
 import pandas as pd
@@ -73,13 +73,29 @@ def _score_training_segments(
     detector: BaseDetector,
     X_train: pd.DataFrame,
     train_score_segments: Optional[List[pd.DataFrame]],
-) -> pd.Series:
+    train_score_segment_labels: Optional[List[str]] = None,
+) -> Tuple[pd.Series, List[Dict[str, object]]]:
     """Score calibration rows, optionally preserving contiguous train blocks."""
     if not train_score_segments:
-        return _as_series(detector.score(X_train), X_train.index, "anom_score_train")
+        scores = _as_series(detector.score(X_train), X_train.index, "anom_score_train")
+        return scores, [
+            {
+                "source": "train",
+                "raw_rows": int(X_train.shape[0]),
+                "scored_rows": int(np.isfinite(scores.to_numpy(dtype=float)).sum()),
+            }
+        ]
+
+    if train_score_segment_labels is not None and len(train_score_segment_labels) != len(
+        train_score_segments
+    ):
+        raise ValueError(
+            "train_score_segment_labels must match train_score_segments length."
+        )
 
     scored_segments: List[pd.Series] = []
-    for segment in train_score_segments:
+    segment_stats: List[Dict[str, object]] = []
+    for segment_idx, segment in enumerate(train_score_segments):
         if segment is None or segment.shape[0] < 2:
             continue
         segment_scores = _as_series(
@@ -88,10 +104,27 @@ def _score_training_segments(
             "anom_score_train",
         )
         scored_segments.append(segment_scores)
+        source = (
+            str(train_score_segment_labels[segment_idx])
+            if train_score_segment_labels is not None
+            else f"segment_{segment_idx}"
+        )
+        segment_stats.append(
+            {
+                "source": source,
+                "raw_rows": int(segment.shape[0]),
+                "scored_rows": int(
+                    np.isfinite(segment_scores.to_numpy(dtype=float)).sum()
+                ),
+            }
+        )
 
     if not scored_segments:
-        return pd.Series(dtype=float, name="anom_score_train")
-    return pd.concat(scored_segments).sort_index().rename("anom_score_train")
+        return pd.Series(dtype=float, name="anom_score_train"), []
+    return (
+        pd.concat(scored_segments).sort_index().rename("anom_score_train"),
+        segment_stats,
+    )
 
 
 def train_and_score(
@@ -99,6 +132,7 @@ def train_and_score(
     X_train: pd.DataFrame,
     X_all: pd.DataFrame,
     train_score_segments: Optional[List[pd.DataFrame]] = None,
+    train_score_segment_labels: Optional[List[str]] = None,
 ) -> Tuple[pd.DataFrame, dict]:
     """Fit detector on X_train and score X_all with shared post-processing."""
     if X_train is None or X_all is None:
@@ -108,7 +142,19 @@ def train_and_score(
 
     detector.fit(X_train)
     scores_all = _as_series(detector.score(X_all), X_all.index, "anom_score")
-    scores_train = _score_training_segments(detector, X_train, train_score_segments)
+    scores_train, calibration_source_counts = _score_training_segments(
+        detector,
+        X_train,
+        train_score_segments,
+        train_score_segment_labels=train_score_segment_labels,
+    )
+    calibration_rows = sum(
+        int(row["raw_rows"]) for row in calibration_source_counts
+    )
+    calibration_segment_count = len(calibration_source_counts)
+    finite_calibration_scores = int(
+        np.isfinite(scores_train.to_numpy(dtype=float)).sum()
+    )
 
     risk_score = build_risk_score(scores_train, scores_all)
     thr, thr_info = compute_threshold(scores_train)
@@ -123,6 +169,10 @@ def train_and_score(
     info = {
         "n_total": int(X_all.shape[0]),
         "n_train": int(X_train.shape[0]),
+        "n_calibration_rows": int(calibration_rows),
+        "n_calibration_segments": int(calibration_segment_count),
+        "n_calibration_scores": finite_calibration_scores,
+        "calibration_source_counts": calibration_source_counts,
         "pct_anom": float(out["is_anomaly"].mean()),
         "threshold": float(thr),
         "label_rule": thr_info["label_rule"],

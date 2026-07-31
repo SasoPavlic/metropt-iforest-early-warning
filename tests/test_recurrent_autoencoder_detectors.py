@@ -331,12 +331,20 @@ def test_train_and_score_can_calibrate_on_contiguous_train_segments_only():
     X_train = pd.concat([train_a, train_b])
     detector = RecordingDetector()
 
-    _pred, _info = train_and_score(
+    _pred, info = train_and_score(
         detector,
         X_train,
         X.iloc[3:5],
         train_score_segments=[train_a, train_b],
+        train_score_segment_labels=["baseline", "local"],
     )
 
     assert detector.train_length == 6
     assert detector.score_lengths == [2, 3, 3]
+    assert info["n_calibration_rows"] == 6
+    assert info["n_calibration_segments"] == 2
+    assert info["n_calibration_scores"] == 6
+    assert info["calibration_source_counts"] == [
+        {"source": "baseline", "raw_rows": 3, "scored_rows": 3},
+        {"source": "local", "raw_rows": 3, "scored_rows": 3},
+    ]

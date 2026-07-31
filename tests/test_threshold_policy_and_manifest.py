@@ -528,7 +528,10 @@ def test_resolve_manifest_cycle_trained_and_alias(tmp_path: Path):
     scaler_file = tmp_path / "cycle_01" / "scaler.joblib"
     model_file.parent.mkdir(parents=True, exist_ok=True)
     model_file.write_text("x", encoding="utf-8")
-    meta_file.write_text("{}", encoding="utf-8")
+    meta_file.write_text(
+        '{"preprocessing_contract": {}}',
+        encoding="utf-8",
+    )
     scaler_file.write_text("x", encoding="utf-8")
 
     manifest = {

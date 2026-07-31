@@ -6,11 +6,79 @@ import json
 from pathlib import Path
 from typing import Optional
 
-from .detectors.imported_recurrent_autoencoder_detector import ARTIFACT_CONTRACT_VERSION
+from .detectors.imported_recurrent_autoencoder_detector import (
+    ARTIFACT_CONTRACT_VERSION,
+    BINARY_AWARE_PREPROCESSING_POLICY,
+    LEGACY_PREPROCESSING_POLICY,
+    PREPROCESSING_POLICY_VERSION,
+    SUPPORTED_PREPROCESSING_POLICIES,
+)
 
 
 def _cycle_key(cycle_id: int) -> str:
     return f"{int(cycle_id):02d}"
+
+
+def _manifest_preprocessing_summary(entry: dict) -> dict:
+    policy = str(
+        entry.get("preprocessing_policy") or LEGACY_PREPROCESSING_POLICY
+    ).strip().lower()
+    if policy not in SUPPORTED_PREPROCESSING_POLICIES:
+        raise ValueError(f"Unsupported manifest preprocessing_policy={policy!r}.")
+    version = str(
+        entry.get("preprocessing_policy_version") or PREPROCESSING_POLICY_VERSION
+    )
+    if version != PREPROCESSING_POLICY_VERSION:
+        raise ValueError(
+            "Unsupported manifest preprocessing policy version: "
+            f"policy={policy!r}, version={version!r}."
+        )
+    contract_hash = entry.get("preprocessing_contract_hash")
+    passthrough_count = int(entry.get("binary_passthrough_feature_count") or 0)
+    if policy == BINARY_AWARE_PREPROCESSING_POLICY:
+        if not contract_hash:
+            raise ValueError(
+                "Binary-aware manifest cycle is missing preprocessing_contract_hash."
+            )
+        if passthrough_count < 1:
+            raise ValueError(
+                "Binary-aware manifest cycle must declare a positive "
+                "binary_passthrough_feature_count."
+            )
+    elif passthrough_count != 0:
+        raise ValueError(
+            "Legacy manifest preprocessing policy cannot declare binary passthrough features."
+        )
+    return {
+        "policy": policy,
+        "version": version,
+        "contract_hash": contract_hash,
+        "passthrough_count": passthrough_count,
+    }
+
+
+def _metadata_preprocessing_summary(meta_path: Path) -> dict:
+    try:
+        metadata = json.loads(meta_path.read_text(encoding="utf-8"))
+    except Exception as exc:
+        raise ValueError(f"Failed to parse imported model metadata: {meta_path}") from exc
+    preprocessing_contract = metadata.get("preprocessing_contract")
+    if not isinstance(preprocessing_contract, dict):
+        raise ValueError(
+            f"Imported model metadata is missing preprocessing_contract: {meta_path}"
+        )
+    return _manifest_preprocessing_summary(
+        {
+            "preprocessing_policy": preprocessing_contract.get("policy"),
+            "preprocessing_policy_version": preprocessing_contract.get(
+                "policy_version"
+            ),
+            "preprocessing_contract_hash": preprocessing_contract.get("contract_hash"),
+            "binary_passthrough_feature_count": preprocessing_contract.get(
+                "passthrough_feature_count", 0
+            ),
+        }
+    )
 
 
 def _load_cycle_manifest(path: str) -> tuple[dict, Path]:
@@ -32,6 +100,14 @@ def _load_cycle_manifest(path: str) -> tuple[dict, Path]:
         )
     if "cycles" not in payload or not isinstance(payload["cycles"], dict):
         raise ValueError(f"Invalid cycle manifest format at {p}: missing 'cycles' object.")
+    top_level_policy = str(
+        payload.get("preprocessing_policy") or LEGACY_PREPROCESSING_POLICY
+    ).strip().lower()
+    if top_level_policy not in SUPPORTED_PREPROCESSING_POLICIES:
+        raise ValueError(
+            f"Unsupported top-level manifest preprocessing_policy={top_level_policy!r}."
+        )
+    observed_policies: set[str] = set()
     for key, entry in payload["cycles"].items():
         if not isinstance(entry, dict):
             raise ValueError(f"Invalid cycle manifest format at {p}: cycle {key} entry is not an object.")
@@ -47,11 +123,32 @@ def _load_cycle_manifest(path: str) -> tuple[dict, Path]:
                 raise ValueError(
                     f"Cycle {key} status=trained is missing required v2 fields: {', '.join(missing)}."
                 )
+            summary = _manifest_preprocessing_summary(entry)
+            observed_policies.add(summary["policy"])
         elif status == "alias":
             if entry.get("alias_to") is None:
                 raise ValueError(f"Cycle {key} status=alias is missing alias_to.")
         elif status != "missing":
             raise ValueError(f"Cycle {key} has unsupported status={status!r}.")
+    declared_observed = payload.get("observed_preprocessing_policies")
+    if declared_observed is not None:
+        if not isinstance(declared_observed, list):
+            raise ValueError(
+                "Manifest observed_preprocessing_policies must be a list when present."
+            )
+        normalized_declared = sorted(
+            str(policy).strip().lower() for policy in declared_observed
+        )
+        if normalized_declared != sorted(observed_policies):
+            raise ValueError(
+                "Manifest observed_preprocessing_policies does not match trained-cycle summaries."
+            )
+        unsupported = set(normalized_declared) - SUPPORTED_PREPROCESSING_POLICIES
+        if unsupported:
+            raise ValueError(
+                "Manifest observed_preprocessing_policies contains unsupported policies: "
+                f"{sorted(unsupported)}."
+            )
     return payload, p.parent
 
 
@@ -130,11 +227,29 @@ def _resolve_manifest_cycle(
             )
         if not strict and (not model_exists or not meta_exists or not scaler_exists):
             return None
+        manifest_preprocessing = _manifest_preprocessing_summary(entry)
+        metadata_preprocessing = _metadata_preprocessing_summary(Path(meta_path))
+        for field in ("policy", "version", "contract_hash", "passthrough_count"):
+            if manifest_preprocessing[field] != metadata_preprocessing[field]:
+                raise ValueError(
+                    "Manifest/model metadata preprocessing mismatch for "
+                    f"cycle {key}, field={field}: "
+                    f"manifest={manifest_preprocessing[field]!r}, "
+                    f"metadata={metadata_preprocessing[field]!r}."
+                )
         resolved = dict(entry)
         resolved["resolved_cycle_id"] = int(entry.get("cycle_id", int(cycle_id)))
         resolved["model_path"] = model_path
         resolved["meta_path"] = meta_path
         resolved["scaler_path"] = scaler_path
+        resolved["preprocessing_policy"] = manifest_preprocessing["policy"]
+        resolved["preprocessing_policy_version"] = manifest_preprocessing["version"]
+        resolved["preprocessing_contract_hash"] = manifest_preprocessing[
+            "contract_hash"
+        ]
+        resolved["binary_passthrough_feature_count"] = manifest_preprocessing[
+            "passthrough_count"
+        ]
         return resolved
 
     if status == "alias":
@@ -154,4 +269,3 @@ def _resolve_manifest_cycle(
     if strict:
         raise ValueError(f"Cycle {key} unavailable in manifest (status={status!r}).")
     return None
-

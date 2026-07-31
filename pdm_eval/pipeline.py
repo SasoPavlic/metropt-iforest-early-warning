@@ -13,6 +13,7 @@ Single-series anomaly explorer (native timeline plot, MetroPT-3).
 from __future__ import annotations
 
 import json
+import os
 import random
 import time
 from datetime import datetime
@@ -38,10 +39,8 @@ from .metrics.alarm_islands import (
 from .metrics.event import evaluate_maintenance_prediction
 from .metrics.point import confusion_and_scores, evaluate_risk_thresholds
 from .manifest import (
-    _cycle_key,
     _load_cycle_manifest,
     _resolve_manifest_cycle,
-    _resolve_manifest_path,
 )
 from .detectors import get_detector
 from .detectors.recurrent_autoencoder_detector import (
@@ -56,10 +55,14 @@ from .detectors.recurrent_autoencoder_detector import (
 from .detectors.postprocess import train_and_score
 from .detectors.utils import time_based_train_mask
 from .visualization.plots import plot_raw_timeline, plot_lead_time_distribution, plot_pr_vs_lead_time
-from .logging_utils import log_to_file
 
 
 IMPORTED_RECURRENT_AUTOENCODER_TYPE = "imported-recurrent-autoencoder"
+_IMPORTED_CALIBRATION_POLICIES = {
+    "full_baseline",
+    "balanced_baseline_local",
+    "local_only",
+}
 
 
 def parse_risk_grid_spec(spec: str) -> List[float]:
@@ -348,6 +351,18 @@ def _validate_runtime_configuration(mode: str) -> None:
         return
 
     if imported:
+        try:
+            _normalize_imported_calibration_policy(
+                IMPORTED_CALIBRATION_COMPOSITION_POLICY
+            )
+        except ValueError as exc:
+            _config_error(
+                str(exc),
+                [
+                    "Use one of: full_baseline, balanced_baseline_local, local_only.",
+                    "Keep full_baseline to reproduce the previous imported-model calibration behavior.",
+                ],
+            )
         if not PER_MAINT_MODEL_MANIFEST_PATH:
             _config_error(
                 "PER_MAINT_MODEL_MANIFEST_PATH is required when PER_MAINT_USE_IMPORTED_MODELS=True.",
@@ -418,7 +433,9 @@ INPUT_TIMESTAMP_COL: Optional[str] = None
 DROP_UNNAMED_INDEX: bool = True
 # Unified output root:
 # artifacts/<detector-group>/<regime>/{logs,plots,predictions}
-ARTIFACTS_ROOT: str = "artifacts"
+ARTIFACTS_ROOT: str = (
+    os.environ.get("METROPT_ARTIFACTS_ROOT", "artifacts").strip() or "artifacts"
+)
 # Input/outputs
 INPUT_PATH: str = "datasets/MetroPT3.csv"
 SAVE_FIG_PATH: Optional[str] = "metropt3_raw.png"
@@ -437,6 +454,20 @@ EXPERIMENT_MODE: str = "per_maint"
 PER_MAINT_USE_IMPORTED_MODELS: bool = True
 PER_MAINT_MODEL_MANIFEST_PATH: Optional[str] = r'C:\Users\sasop\CodexProjects\nianet\NiaNetVAE\logs\per_maint_vae_finetune_alarm_burden_200plus\MetroPT\cycle_manifest.json'
 PER_MAINT_MODEL_STRICT: bool = True
+# Imported-model score calibration composition:
+# - "full_baseline": all initial-baseline rows plus all available local rows
+#   (the backward-compatible behavior used by existing evidence runs),
+# - "balanced_baseline_local": equal baseline/local row counts, selected deterministically
+#   from the chronological tail of each source,
+# - "local_only": only the current post-maintenance local block.
+# Requested cycle 0 always uses the initial baseline only, for every policy.
+IMPORTED_CALIBRATION_COMPOSITION_POLICY: str = (
+    os.environ.get(
+        "METROPT_IMPORTED_CALIBRATION_COMPOSITION_POLICY",
+        "full_baseline",
+    ).strip()
+    or "full_baseline"
+)
 
 # Detector backend for local training ("iforest", "recurrent-vae", "recurrent-sae")
 DETECTOR_TYPE: str = "recurrent-vae"
@@ -730,6 +761,158 @@ def _dataframe_segments_from_mask(X: pd.DataFrame, mask: pd.Series) -> List[pd.D
     if start is not None:
         segments.append(X.iloc[start:])
     return [segment for segment in segments if not segment.empty]
+
+
+def _normalize_imported_calibration_policy(policy: object) -> str:
+    """Return a validated imported-model calibration composition policy."""
+    normalized = str(policy or "").strip().lower().replace("-", "_")
+    if normalized not in _IMPORTED_CALIBRATION_POLICIES:
+        allowed = ", ".join(sorted(_IMPORTED_CALIBRATION_POLICIES))
+        raise ValueError(
+            f"Unsupported IMPORTED_CALIBRATION_COMPOSITION_POLICY={policy!r}; "
+            f"use one of: {allowed}."
+        )
+    return normalized
+
+
+def _latest_true_rows(mask: pd.Series, count: int) -> pd.Series:
+    """Select the latest ``count`` true rows without changing their order."""
+    aligned = mask.astype(bool)
+    positions = np.flatnonzero(aligned.to_numpy(dtype=bool))
+    if count < 0:
+        raise ValueError("Calibration row count must not be negative.")
+    selected = pd.Series(False, index=aligned.index, dtype=bool)
+    if count:
+        selected.iloc[positions[-count:]] = True
+    return selected
+
+
+def _build_imported_calibration_segments(
+    X: pd.DataFrame,
+    train_mask: pd.Series,
+    initial_baseline_mask: pd.Series,
+    requested_cycle_id: int,
+    policy: object,
+    fallback_local_mask: Optional[pd.Series] = None,
+    fallback_local_cycle_id: Optional[int] = None,
+) -> Tuple[List[pd.DataFrame], Dict[str, object]]:
+    """Compose chronological score-calibration blocks for an imported model.
+
+    ``full_baseline`` exactly preserves the previous behavior.
+    ``balanced_baseline_local`` selects equal raw-row counts from the latest
+    part of the initial baseline and current local block. ``local_only``
+    excludes the initial baseline. Cycle 0 is always calibrated on the full
+    initial baseline.
+    """
+    configured_policy = _normalize_imported_calibration_policy(policy)
+    train = _ensure_bool_mask(train_mask, X.index)
+    baseline = train & _ensure_bool_mask(initial_baseline_mask, X.index)
+    current_local = train & ~baseline
+    local = current_local
+    baseline_available = int(baseline.sum())
+    current_local_available = int(current_local.sum())
+    fallback_local = pd.Series(False, index=X.index, dtype=bool)
+    if fallback_local_mask is not None:
+        fallback_local = _ensure_bool_mask(fallback_local_mask, X.index) & ~_ensure_bool_mask(
+            initial_baseline_mask, X.index
+        )
+    fallback_local_available = int(fallback_local.sum())
+    local_source = "current_train"
+    local_reference_cycle_id: Optional[int] = int(requested_cycle_id)
+
+    if (
+        int(requested_cycle_id) > 0
+        and configured_policy in {"balanced_baseline_local", "local_only"}
+        and current_local_available == 0
+        and fallback_local_available > 0
+    ):
+        local = fallback_local
+        local_source = "carried_forward_latest_available"
+        local_reference_cycle_id = (
+            int(fallback_local_cycle_id)
+            if fallback_local_cycle_id is not None
+            else None
+        )
+    local_available = int(local.sum())
+
+    if int(requested_cycle_id) == 0:
+        used_mask = baseline
+        effective_policy = "baseline_only_cycle0"
+        selection = "all_initial_baseline_rows"
+        local_source = "not_applicable_cycle0"
+        local_reference_cycle_id = None
+    elif configured_policy == "full_baseline":
+        used_mask = train
+        effective_policy = configured_policy
+        selection = "all_available_rows"
+    elif configured_policy == "balanced_baseline_local":
+        if baseline_available == 0 or local_available == 0:
+            raise ValueError(
+                "Imported calibration policy 'balanced_baseline_local' requires both baseline "
+                f"and local rows for requested_cycle_id={requested_cycle_id}; "
+                f"available baseline={baseline_available}, local={local_available}."
+            )
+        rows_per_source = min(baseline_available, local_available)
+        used_mask = _latest_true_rows(baseline, rows_per_source) | _latest_true_rows(
+            local, rows_per_source
+        )
+        effective_policy = configured_policy
+        selection = (
+            "chronological_tail_equal_rows"
+            if local_source == "current_train"
+            else "chronological_tail_equal_rows_with_carried_forward_local"
+        )
+    else:
+        if local_available == 0:
+            raise ValueError(
+                "Imported calibration policy 'local_only' requires local rows "
+                f"for requested_cycle_id={requested_cycle_id}."
+            )
+        used_mask = local
+        effective_policy = configured_policy
+        selection = (
+            "all_local_rows"
+            if local_source == "current_train"
+            else "all_carried_forward_local_rows"
+        )
+
+    baseline_used = int((used_mask & baseline).sum())
+    local_used = int((used_mask & local).sum())
+    sourced_segments = [
+        (segment.index[0], "baseline", segment)
+        for segment in _dataframe_segments_from_mask(X, used_mask & baseline)
+    ]
+    sourced_segments.extend(
+        (segment.index[0], "local", segment)
+        for segment in _dataframe_segments_from_mask(X, used_mask & local)
+    )
+    sourced_segments.sort(key=lambda item: item[0])
+    segments = [item[2] for item in sourced_segments]
+    segment_sources = [item[1] for item in sourced_segments]
+    calibration_rows = int(sum(len(segment) for segment in segments))
+    if calibration_rows < 2:
+        raise ValueError(
+            "Imported calibration composition produced fewer than 2 rows for "
+            f"requested_cycle_id={requested_cycle_id}."
+        )
+
+    metadata: Dict[str, object] = {
+        "configured_policy": configured_policy,
+        "effective_policy": effective_policy,
+        "selection": selection,
+        "baseline_rows_available": baseline_available,
+        "local_rows_available": local_available,
+        "current_local_rows_available": current_local_available,
+        "fallback_local_rows_available": fallback_local_available,
+        "local_source": local_source,
+        "local_reference_cycle_id": local_reference_cycle_id,
+        "baseline_rows_used": baseline_used,
+        "local_rows_used": local_used,
+        "calibration_rows": calibration_rows,
+        "calibration_segment_count": len(segments),
+        "calibration_segment_sources": segment_sources,
+    }
+    return segments, metadata
 
 
 def _build_imported_expected_contract(cycle_id: int) -> Dict[str, object]:
@@ -1617,18 +1800,24 @@ def _run_per_maintenance_experiment(
     first_start = starts[0]
     pre_w1_test_mask = (index < first_start) & (~initial_train_order_mask)
     current_train_mask = initial_train_mask
+    latest_nonempty_local_mask = pd.Series(False, index=index, dtype=bool)
+    latest_nonempty_local_cycle_id: Optional[int] = None
 
     use_imported_models = bool(PER_MAINT_USE_IMPORTED_MODELS)
     detector_type_runtime = DETECTOR_TYPE
     detector_kwargs_runtime: Dict[str, object] = dict(DETECTOR_KWARGS)
     manifest_payload: Optional[dict] = None
     manifest_dir: Optional[Path] = None
+    configured_imported_calibration_policy: Optional[str] = None
     if use_imported_models:
         if not PER_MAINT_MODEL_MANIFEST_PATH:
             raise ValueError(
                 "PER_MAINT_USE_IMPORTED_MODELS=True requires PER_MAINT_MODEL_MANIFEST_PATH."
             )
         manifest_payload, manifest_dir = _load_cycle_manifest(PER_MAINT_MODEL_MANIFEST_PATH)
+        configured_imported_calibration_policy = _normalize_imported_calibration_policy(
+            IMPORTED_CALIBRATION_COMPOSITION_POLICY
+        )
         detector_type_runtime = IMPORTED_RECURRENT_AUTOENCODER_TYPE
         detector_kwargs_runtime = {
             "device": REC_DEVICE,
@@ -1643,7 +1832,8 @@ def _run_per_maintenance_experiment(
         }
         print(
             f"[INFO] Per-maint imported recurrent artifact mode enabled. "
-            f"Manifest={Path(PER_MAINT_MODEL_MANIFEST_PATH).resolve()}"
+            f"Manifest={Path(PER_MAINT_MODEL_MANIFEST_PATH).resolve()} "
+            f"calibration_policy={configured_imported_calibration_policy}"
         )
 
     def _is_trainable(train_mask: pd.Series, test_mask: pd.Series) -> bool:
@@ -1754,7 +1944,9 @@ def _run_per_maintenance_experiment(
             detector_kwargs["expected_contract"] = _build_imported_expected_contract(resolved_cycle_id)
             print(
                 f"[INFO] Imported model: segment={seg_label} requested_cycle={requested_cycle_id} "
-                f"resolved_cycle={resolved_cycle_id}"
+                f"resolved_cycle={resolved_cycle_id} "
+                f"preprocessing_policy={resolved_entry.get('preprocessing_policy', 'standard_scaler_v1')} "
+                f"binary_passthrough_features={resolved_entry.get('binary_passthrough_feature_count', 0)}"
             )
 
         detector = get_detector(detector_type_runtime, **detector_kwargs)
@@ -1764,12 +1956,31 @@ def _run_per_maintenance_experiment(
             t_seg = _log_step_start(
                 f"{run_label} {seg_label} (train={X_train.shape[0]}, test={X_test.shape[0]})"
             )
-        train_score_segments = _dataframe_segments_from_mask(X, train_mask) if use_imported_models else None
+        calibration_metadata: Optional[Dict[str, object]] = None
+        train_score_segment_labels: Optional[List[str]] = None
+        if use_imported_models:
+            if configured_imported_calibration_policy is None:
+                raise RuntimeError("Imported calibration policy is not initialized.")
+            train_score_segments, calibration_metadata = _build_imported_calibration_segments(
+                X=X,
+                train_mask=train_mask,
+                initial_baseline_mask=initial_train_mask,
+                requested_cycle_id=int(requested_cycle_id),
+                policy=configured_imported_calibration_policy,
+                fallback_local_mask=latest_nonempty_local_mask,
+                fallback_local_cycle_id=latest_nonempty_local_cycle_id,
+            )
+            train_score_segment_labels = list(
+                calibration_metadata["calibration_segment_sources"]
+            )
+        else:
+            train_score_segments = None
         slice_pred, info = train_and_score(
             detector,
             X_train,
             X_test,
             train_score_segments=train_score_segments,
+            train_score_segment_labels=train_score_segment_labels,
         )
         if t_seg is not None:
             run_label = "Infer segment" if use_imported_models else "Run segment"
@@ -1782,7 +1993,41 @@ def _run_per_maintenance_experiment(
 
         risk_segments.append(test_mask)
 
-        return {
+        if calibration_metadata is not None:
+            source_score_counts = {"baseline": 0, "local": 0}
+            for source_row in info.get("calibration_source_counts", []):
+                source = str(source_row.get("source", ""))
+                if source in source_score_counts:
+                    source_score_counts[source] += int(
+                        source_row.get("scored_rows", 0)
+                    )
+            calibration_metadata["baseline_scored_rows"] = source_score_counts[
+                "baseline"
+            ]
+            calibration_metadata["local_scored_rows"] = source_score_counts["local"]
+            calibration_metadata["calibration_scored_rows"] = int(
+                info.get("n_calibration_scores", 0)
+            )
+            print(
+                "[INFO] Imported calibration composition: "
+                f"segment={seg_label} requested_cycle={requested_cycle_id} "
+                f"resolved_cycle={resolved_cycle_id} "
+                f"configured_policy={calibration_metadata['configured_policy']} "
+                f"effective_policy={calibration_metadata['effective_policy']} "
+                f"selection={calibration_metadata['selection']} "
+                f"baseline_rows={calibration_metadata['baseline_rows_used']}/"
+                f"{calibration_metadata['baseline_rows_available']} "
+                f"local_rows={calibration_metadata['local_rows_used']}/"
+                f"{calibration_metadata['local_rows_available']} "
+                f"local_source={calibration_metadata['local_source']} "
+                f"local_reference_cycle={calibration_metadata['local_reference_cycle_id']} "
+                f"baseline_scored_rows={calibration_metadata['baseline_scored_rows']} "
+                f"local_scored_rows={calibration_metadata['local_scored_rows']} "
+                f"calibration_scored_rows={calibration_metadata['calibration_scored_rows']} "
+                f"segments={calibration_metadata['calibration_segment_count']}"
+            )
+
+        segment_info = {
             "segment": seg_label,
             "train_size": info["n_train"],
             "test_size": X_test.shape[0],
@@ -1795,6 +2040,9 @@ def _run_per_maintenance_experiment(
             "requested_cycle_id": requested_cycle_id,
             "resolved_cycle_id": resolved_cycle_id,
         }
+        if calibration_metadata is not None:
+            segment_info["imported_calibration"] = dict(calibration_metadata)
+        return segment_info
 
     # Model 0: pre-W1 region, trained on the initial TRAIN_FRAC slice only.
     seg_info = _fit_and_score_segment(
@@ -1879,6 +2127,9 @@ def _run_per_maintenance_experiment(
         if seg_info:
             period_infos.append(seg_info)
             current_train_mask = train_mask_new
+            if bool(local_post_mask.any()):
+                latest_nonempty_local_mask = local_post_mask.copy()
+                latest_nonempty_local_cycle_id = int(j + 1)
 
     # Compute maintenance risk per segment (reset at segment boundaries).
     if "risk_score" in pred.columns:
@@ -1966,6 +2217,20 @@ def _run_per_maintenance_experiment(
         "manifest_path": str(Path(PER_MAINT_MODEL_MANIFEST_PATH).resolve()) if use_imported_models else None,
         "detector_type": detector_type_runtime,
     }
+    if use_imported_models:
+        summary_info["imported_calibration"] = {
+            "configured_policy": configured_imported_calibration_policy,
+            "segments": [
+                {
+                    "segment": info["segment"],
+                    "requested_cycle_id": info.get("requested_cycle_id"),
+                    "resolved_cycle_id": info.get("resolved_cycle_id"),
+                    **dict(info["imported_calibration"]),
+                }
+                for info in period_infos
+                if info.get("imported_calibration") is not None
+            ],
+        }
     summary_info["event_metrics"] = event_results
     summary_info["threshold_policy"] = threshold_policy_report
     summary_info["alarm_island_summary"] = alarm_island_summary

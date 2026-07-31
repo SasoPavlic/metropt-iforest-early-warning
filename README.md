@@ -77,6 +77,40 @@ To consume pretrained per-cycle recurrent artifacts exported from `NiaNetVAE`:
 
 In this mode, metropt resolves cycle models from the manifest (including alias cycles) and uses them in fixed inference mode (no model weight updates in this repository). `DETECTOR_TYPE` is ignored for imported per-maint evaluation.
 
+Imported preprocessing is artifact-driven and versioned. Older contract-v2 artifacts without a policy are interpreted as `standard_scaler_v1`, which preserves the historical behavior of standardizing every rolling feature. New `binary_passthrough_v1` artifacts keep the same rolling feature names, order, and model input dimension, but their exported scaler applies identity scaling to binary-derived columns. Runtime rolling-feature generation is unchanged: metropt always loads and applies the exported `scaler.joblib`.
+
+Before inference, metropt cross-checks the manifest summary, model metadata, preprocessing policy/version/hash, binary-derived and passthrough names/indices, exact runtime feature order, scaler custom attributes, and scaler state hash. Any disagreement fails before scoring. Alias cycles inherit the validated contract of their resolved trained cycle.
+
+`IMPORTED_CALIBRATION_COMPOSITION_POLICY` controls which chronological rows calibrate the imported model's anomaly-score percentile map and point threshold:
+- `"full_baseline"` (default) uses the complete initial baseline plus the available local post-maintenance block, preserving previous behavior.
+- `"balanced_baseline_local"` uses equal baseline/local row counts selected deterministically from the chronological tail of each block.
+- `"local_only"` uses only the available local post-maintenance block.
+
+Cycle 0 always uses the complete initial baseline, regardless of the configured policy. If a later alias/reused-model cycle has no new local rows, `balanced_baseline_local` and `local_only` carry forward the latest earlier local calibration block rather than silently reverting to baseline-only; the source cycle and carry-forward selection are logged. The run fails fast only when neither current nor prior local rows exist. Runs log configured/effective policy, current/fallback source, reference cycle, raw-row counts, and valid scored-row counts for every segment.
+
+For repeatable policy comparisons, use environment overrides instead of editing source and give every policy a separate artifact root. Run policies sequentially so they do not contend for the same GPU or output files:
+
+```powershell
+$python = "C:\Users\sasop\AppData\Local\pypoetry\Cache\virtualenvs\metropt-pdm-framework-79LhM6yD-py3.11\Scripts\python.exe"
+$policies = "full_baseline", "balanced_baseline_local", "local_only"
+$runTag = Get-Date -Format "yyyyMMdd_HHmmss"
+
+try {
+    foreach ($policy in $policies) {
+        $env:METROPT_IMPORTED_CALIBRATION_COMPOSITION_POLICY = $policy
+        $env:METROPT_ARTIFACTS_ROOT = "artifacts/calibration_policy_${policy}_$runTag"
+        & $python main.py
+        if ($LASTEXITCODE -ne 0) { throw "MetroPT run failed for policy $policy" }
+    }
+}
+finally {
+    Remove-Item Env:METROPT_IMPORTED_CALIBRATION_COMPOSITION_POLICY -ErrorAction SilentlyContinue
+    Remove-Item Env:METROPT_ARTIFACTS_ROOT -ErrorAction SilentlyContinue
+}
+```
+
+The environment variables only override `IMPORTED_CALIBRATION_COMPOSITION_POLICY` and `ARTIFACTS_ROOT`; all frozen evaluation constants and the selected manifest remain unchanged.
+
 #### Recommended local setup (Windows dedicated venv)
 Use a dedicated Python 3.11 virtual environment for metropt imported-mode evaluation to avoid changing your existing interpreter:
 
